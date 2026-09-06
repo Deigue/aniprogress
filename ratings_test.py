@@ -171,10 +171,70 @@ def test_unrated_is_not_zero() -> None:
     check("unrated on both sides writes nothing", (to_al, to_fl), ([], []))
 
 
+def test_simkl_never_scores_anilist() -> None:
+    """The rule that protects every decimal on AniList.
+
+    Regression test for a real bug: the outbound tick used to hand Simkl's
+    rounded score to AniList, and the guard allowed the write whenever the two
+    differed by 1.0 or more. Against the live library that would have turned
+    Kokoro Connect 5.5 into 9.0 and Mushoku Tensei 8.7 into 6.0, with 121
+    decimal scores exposed.
+    """
+    print("\n" + "=" * 70 + "\nOUTBOUND - Simkl must never write a score to AniList\n" + "=" * 70)
+    from aniprogress.main import outbound_tick
+    from aniprogress.simkl import Simkl
+
+    class StubSimkl:
+        def activities(self):
+            return {"all": "2026-01-01T00:00:00Z"}
+
+        def all_items(self, media_type="anime", status=None, date_from=None, extended="full"):
+            return {"anime": [{
+                "status": "completed",
+                "watched_episodes_count": 12,
+                "user_rating": 9,                      # Simkl's rounded score
+                "show": {"title": "Decimal Holder",
+                         "ids": {"mal": "601", "anilist": "6001"}},
+            }]}
+
+        anime_entries = staticmethod(Simkl.anime_entries)
+        ids_of = staticmethod(Simkl.ids_of)
+
+    class SpyAniList:
+        def __init__(self):
+            self.saves = []
+
+        def list_entries(self):
+            # AniList already holds a hand-set decimal well over 1.0 away
+            return [al_entry(6001, 601, 5.5, "Decimal Holder")]
+
+        def by_mal(self, id_mal):
+            return {"id": 6001}
+
+        def save(self, media_id, status=None, progress=None, score_1dp=None):
+            self.saves.append({"mediaId": media_id, "status": status,
+                               "progress": progress, "score_1dp": score_1dp})
+            return {}
+
+    cfg = Config()
+    cfg.enable_anilist = True
+    cfg.enable_mal = False
+    cfg.dry_run = False
+    st = State(os.path.join(tempfile.mkdtemp(), "state.json"))
+    al = SpyAniList()
+    outbound_tick(cfg, st, StubSimkl(), al, None)
+
+    scores = [s["score_1dp"] for s in al.saves]
+    check("no save carried a score", scores, [None] * len(scores) if scores else [])
+    check("a score was never sent at all", any(s is not None for s in scores), False)
+    check("progress still flowed", [s["progress"] for s in al.saves], [12])
+
+
 def main() -> int:
     for fn in (test_plan_skip_is_default, test_plan_floppy_wins, test_plan_anilist_wins,
                test_tick_and_idempotence,
-               test_decimals_survive, test_unrated_is_not_zero):
+               test_decimals_survive, test_unrated_is_not_zero,
+               test_simkl_never_scores_anilist):
         fn()
     print("\n" + "=" * 70)
     if FAILURES:

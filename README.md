@@ -3,8 +3,6 @@
 Keeps anime **progress, watchlist status and ratings** in sync between **Simkl**, **AniList**,
 **MyAnimeList** and **Floppy**.
 
-> Unrelated to any streaming site. This talks to tracker APIs only.
-
 ## What it does
 
 **Progress and watchlist**
@@ -14,18 +12,15 @@ Keeps anime **progress, watchlist status and ratings** in sync between **Simkl**
 
 **Ratings**
 
-| Direction | Behaviour |
-| --- | --- |
-| AniList → Simkl | moves ratings, **rounded** to a whole number |
-| Simkl → AniList | **no ratings pushed** |
+| Direction        | Behaviour                                       |
+| ---------------- | ----------------------------------------------- |
+| AniList → Simkl  | moves ratings, **rounded** to a whole number    |
+| Simkl → AniList  | **no ratings pushed**                           |
 | Floppy ↔ AniList | syncs ratings **both ways, decimals preserved** |
 
 Between Floppy and AniList, a missing rating is filled in from whichever side has one. If the two
 sides hold *different* ratings, that is a person having entered two numbers — so by default neither
 is overwritten and the clash is logged. Set `RATINGS_WINNER` if you would rather one side always win.
-
-Ratings only ever travel *into* a service that can hold a decimal, or *out* to one that
-cannot. A rounded score is never read back, so `7.8` cannot decay into `8`.
 
 Every direction is a no-op when nothing has changed, so it is cheap to run continuously.
 
@@ -67,33 +62,33 @@ Read the log for a full cycle, then set `DRY_RUN` to `false` and restart.
 
 ### Credentials
 
-| Variable                          | Required                   | Where to get it                                                     |
-| --------------------------------- | -------------------------- | ------------------------------------------------------------------- |
-| `SIMKL_CLIENT_ID`                 | always                     | [Simkl developer settings](https://simkl.com/settings/developer)    |
-| `SIMKL_TOKEN`                     | always                     | OAuth2 access token for your own account                            |
-| `ANILIST_TOKEN`                   | when `ENABLE_ANILIST=true` | [AniList developer settings](https://anilist.co/settings/developer) |
-| `MAL_CLIENT_ID`                   | when `ENABLE_MAL=true`     | MyAnimeList → Account Settings → API                                |
-| `MAL_TOKEN` / `MAL_REFRESH_TOKEN` | when `ENABLE_MAL=true`     | `python -m aniprogress.mal_auth --client-id YOUR_ID`                |
-| `FLOPPY_URL` / `FLOPPY_TOKEN`     | when `ENABLE_FLOPPY_RATINGS=true` | Your Floppy base URL, and Floppy → Settings → API            |
+| Variable                          | Required                          | Where to get it                                                     |
+| --------------------------------- | --------------------------------- | ------------------------------------------------------------------- |
+| `SIMKL_CLIENT_ID`                 | always                            | [Simkl developer settings](https://simkl.com/settings/developer)    |
+| `SIMKL_TOKEN`                     | always                            | OAuth2 access token for your own account                            |
+| `ANILIST_TOKEN`                   | when `ENABLE_ANILIST=true`        | [AniList developer settings](https://anilist.co/settings/developer) |
+| `MAL_CLIENT_ID`                   | when `ENABLE_MAL=true`            | MyAnimeList → Account Settings → API                                |
+| `MAL_TOKEN` / `MAL_REFRESH_TOKEN` | when `ENABLE_MAL=true`            | `python -m aniprogress.mal_auth --client-id YOUR_ID`                |
+| `FLOPPY_URL` / `FLOPPY_TOKEN`     | when `ENABLE_FLOPPY_RATINGS=true` | Your Floppy base URL, and Floppy → Settings → API                   |
 
 ### Switches
 
-| Variable            | Default | What it does                                                  |
-| ------------------- | ------- | ------------------------------------------------------------- |
-| `ENABLE_ANILIST`    | `true`  | Write progress, status and ratings to AniList.                |
-| `ENABLE_MAL`        | `false` | Also mirror to MyAnimeList. Ratings are rounded.              |
-| `ENABLE_SIMKL_PUSH` | `true`  | Allow writes back to Simkl. Turn off to make Simkl read-only. |
-| `ENABLE_FLOPPY_RATINGS` | `false` | Sync ratings both ways with AniList, decimals intact. Needs `ENABLE_ANILIST`. |
-| `RATINGS_WINNER`    | `skip`  | What to do when Floppy and AniList hold *different* ratings. `skip` reports it and writes neither. `floppy` or `anilist` picks a winner. |
-| `DRY_RUN`           | `true`  | Log every write without sending it. **Start here.**           |
+| Variable                | Default | What it does                                                                                                                             |
+| ----------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `ENABLE_ANILIST`        | `true`  | Write progress, status and ratings to AniList.                                                                                           |
+| `ENABLE_MAL`            | `false` | Also mirror to MyAnimeList. Ratings are rounded.                                                                                         |
+| `ENABLE_SIMKL_PUSH`     | `true`  | Allow writes back to Simkl. Turn off to make Simkl read-only.                                                                            |
+| `ENABLE_FLOPPY_RATINGS` | `false` | Sync ratings both ways with AniList, decimals intact. Needs `ENABLE_ANILIST`.                                                            |
+| `RATINGS_WINNER`        | `skip`  | What to do when Floppy and AniList hold *different* ratings. `skip` reports it and writes neither. `floppy` or `anilist` picks a winner. |
+| `DRY_RUN`               | `true`  | Log every write without sending it. **Start here.**                                                                                      |
 
 ### Cadence
 
-| Variable           | Default | What it does                                                                |
-| ------------------ | ------- | --------------------------------------------------------------------------- |
-| `POLL_OUT_SECONDS` | `60`    | How often to check Simkl for new activity. The busy direction.              |
-| `POLL_IN_SECONDS`  | `600`   | How often to check AniList. Raise it if nothing writes to AniList directly. |
-| `POLL_RATINGS_SECONDS` | `900` | How often to reconcile Floppy and AniList ratings. |
+| Variable               | Default | What it does                                                                |
+| ---------------------- | ------- | --------------------------------------------------------------------------- |
+| `POLL_OUT_SECONDS`     | `60`    | How often to check Simkl for new activity. The busy direction.              |
+| `POLL_IN_SECONDS`      | `600`   | How often to check AniList. Raise it if nothing writes to AniList directly. |
+| `POLL_RATINGS_SECONDS` | `900`   | How often to reconcile Floppy and AniList ratings.                          |
 
 ### Other
 
