@@ -1,0 +1,164 @@
+"""Floppy client — anime ratings only.
+
+Floppy stores anime as flat rows keyed by MAL id (`source: "mal"`), which is the
+same key AniList exposes as `idMal`. So the two libraries join directly, with no
+title matching and no TMDB in the path.
+
+Scores are 0–10 with one decimal place on both sides, so a rating moves between
+them without being rounded. That is the whole point of this module: it is the
+only pair in the project where ratings travel in *both* directions.
+
+Standard library only, to keep the image dependency-free.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import time
+from typing import Any, Iterator
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
+log = logging.getLogger("aniprogress.floppy")
+
+PAGE_SIZE = 200
+MAX_PAGES = 200
+
+
+def score_1dp(raw: Any) -> float | None:
+    """Normalise a score to one decimal place, or None when unrated.
+
+    Floppy stores 0 for 'no rating', which must not be confused with a real 0.
+    """
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return round(v, 1) if v > 0 else None
+
+
+class Floppy:
+    def __init__(self, url: str, token: str, dry_run: bool = True, timeout: float = 30.0):
+        self.base = f"{url.rstrip('/')}/api/v1"
+        self.token = token
+        self.dry_run = dry_run
+        self.timeout = timeout
+
+    # --- transport -----------------------------------------------------------
+    def _request(self, method: str, path: str, *, params: dict | None = None,
+                 body: dict | None = None) -> Any:
+        url = f"{self.base}/{path.strip('/')}/"
+        if params:
+            url = f"{url}?{urlencode(params)}"
+        data = json.dumps(body).encode() if body is not None else None
+        req = Request(url, data=data, method=method, headers={
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "aniprogress/1.0",
+        })
+        for attempt in range(3):
+            try:
+                with urlopen(req, timeout=self.timeout) as r:
+                    raw = r.read()
+                return json.loads(raw.decode()) if raw else {}
+            except HTTPError as e:
+                # A 4xx is a real answer - do not retry it into a rate limit.
+                if 400 <= e.code < 500:
+                    log.error("floppy HTTP %s on %s %s: %s", e.code, method, path,
+                              e.read()[:300])
+                    raise
+                log.warning("floppy HTTP %s on %s, retry %d", e.code, path, attempt + 1)
+            except (URLError, TimeoutError) as e:
+                log.warning("floppy transport error (%s), retry %d", e, attempt + 1)
+            time.sleep(2 * (attempt + 1))
+        raise RuntimeError(f"floppy request failed after retries: {method} {path}")
+
+    # --- reads ---------------------------------------------------------------
+    def _paged(self, path: str, params: dict | None = None) -> Iterator[dict]:
+        """Walk a Floppy list endpoint.
+
+        The envelope is {"pagination": {"total", "limit", "offset", "next",
+        "previous"}, "results": [...]} - note `total`, not `count`, and the
+        absence of `next` is the authoritative end-of-list signal.
+        """
+        offset = 0
+        for _ in range(MAX_PAGES):
+            page = self._request("GET", path,
+                                 params={**(params or {}), "limit": PAGE_SIZE,
+                                         "offset": offset})
+            rows = page.get("results") if isinstance(page, dict) else page
+            if not isinstance(rows, list) or not rows:
+                return
+            for row in rows:
+                if isinstance(row, dict):
+                    yield row
+            pagination = page.get("pagination") if isinstance(page, dict) else None
+            if isinstance(pagination, dict) and not pagination.get("next"):
+                return
+            offset += len(rows)
+
+    @staticmethod
+    def _identity(row: dict) -> tuple[str, str] | None:
+        """(source, media_id) for a list row.
+
+        Both live on the nested `item`, not on the row itself. `item_id` carries
+        the same thing as "anime/mal/10020" and is the fallback.
+        """
+        item = row.get("item")
+        if isinstance(item, dict):
+            source = str(item.get("source") or "").strip().lower()
+            media_id = str(item.get("media_id") or "").strip()
+            if source and media_id:
+                return source, media_id
+        parts = str(row.get("item_id") or "").strip().split("/")
+        if len(parts) >= 3:
+            return parts[1].lower(), parts[2]
+        return None
+
+    def anime_scores(self) -> dict[int, float]:
+        """MAL id -> score, for every rated anime in the library.
+
+        Unrated rows are omitted rather than returned as 0, so callers can tell
+        'no rating' from 'rated zero' without a sentinel.
+        """
+        out: dict[int, float] = {}
+        rows = 0
+        skipped_source = 0
+        for row in self._paged("media/anime"):
+            rows += 1
+            identity = self._identity(row)
+            if identity is None:
+                continue
+            source, media_id = identity
+            if source != "mal":
+                skipped_source += 1
+                continue
+            try:
+                mal_id = int(media_id)
+            except (TypeError, ValueError):
+                continue
+            score = score_1dp(row.get("score"))
+            if score is not None:
+                out[mal_id] = score
+        log.debug("floppy: %d anime rows read, %d rated, %d skipped (source not mal)",
+                  rows, len(out), skipped_source)
+        if rows and not out:
+            log.warning("floppy returned %d anime rows but none carried a score - "
+                        "check the token and the response shape before trusting "
+                        "this as 'nothing is rated'", rows)
+        return out
+
+    # --- writes --------------------------------------------------------------
+    def set_score(self, mal_id: int, score_1dp_value: float) -> dict:
+        """Write a 1dp score onto a MAL-keyed anime row.
+
+        PATCH on the anime endpoint accepts score/progress/status - unlike the
+        TV form, which silently discards anything outside score/status/notes.
+        """
+        payload = {"score": round(float(score_1dp_value), 1)}
+        if self.dry_run:
+            log.info("[dry-run] floppy PATCH media/anime/mal/%s %s", mal_id, payload)
+            return {"dry_run": True}
+        return self._request("PATCH", f"media/anime/mal/{int(mal_id)}", body=payload) or {}

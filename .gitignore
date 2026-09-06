@@ -1,0 +1,8 @@
+.env
+.env.*
+!.env.example
+aniprogress-data/
+*state.json
+__pycache__/
+*.pyc
+.venv/
