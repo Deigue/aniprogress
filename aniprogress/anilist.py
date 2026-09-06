@@ -1,15 +1,10 @@
 """AniList client.
 
-Two things matter here:
+Scores live in `scoreRaw` on a 0-100 scale; with POINT_10_DECIMAL set, 78 shows
+as 7.8. Never write `score`, always `scoreRaw`.
 
-  * Decimals. AniList stores scores as `scoreRaw` on a 0-100 integer scale.
-    With the account set to POINT_10_DECIMAL, 78 renders as 7.8 - so a 1dp
-    Floppy score survives exactly. Never write the `score` field; write
-    `scoreRaw`.
-  * Rate limit. ~90 req/min, degrading hard when abused. One
-    MediaListCollection query returns the entire anime list with each entry's
-    updatedAt, so change detection costs a single request regardless of
-    library size.
+Rate limit is ~90 req/min. One MediaListCollection query returns the whole list
+with each entry's updatedAt, so change detection costs one request.
 """
 from __future__ import annotations
 
@@ -111,16 +106,32 @@ class AniList:
         return self._viewer_id
 
     def list_entries(self) -> list[dict]:
-        """The whole anime list, one request. Each entry carries updatedAt."""
+        """The whole anime list, one request, deduplicated.
+
+        MediaListCollection returns an entry once per list it belongs to, so a
+        title on a custom list comes back two or three times. Measured: 309 rows
+        for 270 entries.
+        """
         data = self._gql(LIST_QUERY, {"userId": self.viewer_id()})
-        out = []
+        seen: dict[int, dict] = {}
+        raw = 0
         for lst in ((data.get("MediaListCollection") or {}).get("lists") or []):
-            out.extend(lst.get("entries") or [])
-        return out
+            for entry in (lst.get("entries") or []):
+                raw += 1
+                key = entry.get("id") or (entry.get("media") or {}).get("id")
+                if key is None:
+                    continue
+                # Keep the most recently touched copy; they are normally identical.
+                prev = seen.get(int(key))
+                if prev is None or int(entry.get("updatedAt") or 0) >= int(prev.get("updatedAt") or 0):
+                    seen[int(key)] = entry
+        if raw != len(seen):
+            log.debug("anilist: %d list rows collapsed to %d unique entries "
+                      "(custom lists overlap the status lists)", raw, len(seen))
+        return list(seen.values())
 
     def by_mal(self, id_mal: int) -> dict | None:
-        """MAL id -> AniList media. Floppy stores anime with MAL ids, so this
-        is a direct lookup rather than fuzzy title matching."""
+        """MAL id -> AniList media."""
         if id_mal in self._mal_cache:
             return self._mal_cache[id_mal]
         media = (self._gql(BY_MAL_QUERY, {"idMal": int(id_mal)}) or {}).get("Media")

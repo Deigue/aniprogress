@@ -1,21 +1,13 @@
-"""aniprogress — keeps anime progress and ratings consistent across
-Simkl, AniList and MyAnimeList.
+"""aniprogress — anime progress and ratings across Simkl, AniList, MAL and Floppy.
 
-It exists because no off-the-shelf tool writes episode progress to AniList:
-CrossWatch's AniList module reports history:False and its only watchlist
-mutation is SaveMediaListEntry(status: PLANNING).
+Exists because nothing off the shelf writes episode progress to AniList.
 
-Two loops:
+  OUTBOUND (fast)   to AniList / MAL, from Simkl. Progress and status only.
+  INBOUND  (slow)   to Simkl, from AniList. For players that write to AniList.
+  RATINGS           Floppy <-> AniList, both ways, 1dp preserved.
 
-  OUTBOUND (fast)   Simkl -> AniList (+ MAL)
-      Nuvio scrobbles to Simkl. Activity-gated, incremental via date_from.
-
-  INBOUND  (slow)   AniList -> Simkl
-      Covers players that write straight to AniList (Seanime). One
-      MediaListCollection query per tick; a no-op unless updatedAt moved.
-
-Ratings only ever flow toward services that can hold 1dp (AniList) or that are
-write-only mirrors (MAL, Simkl). Nothing rounded is ever read back.
+Simkl and MAL store whole numbers, so they are written to and never read from
+for a rating.
 """
 
 from __future__ import annotations
@@ -68,10 +60,11 @@ _RANK = {"PLANNING": 0, "CURRENT": 1, "PAUSED": 1, "DROPPED": 1, "COMPLETED": 2}
 
 
 def guard(have: dict | None, status, progress):
-    """Clamp an intended write so it can only ever improve the target.
+    """Clamp a write so it can only improve the target.
 
-    Returns (status, progress, reason) with None for fields to leave untouched,
-    or None entirely when there is nothing worth writing
+    Returns (status, progress, reason), None for fields to leave alone, or None
+    entirely when there is nothing worth writing. No rating: Simkl's whole
+    numbers must never overwrite an AniList decimal.
     """
     if have is None:  # not on AniList yet - safe to add
         return status, progress, "new"
@@ -96,8 +89,29 @@ def _int_or_none(v):
         return None
 
 
+def _title_of(entry: dict) -> str:
+    """Best available human name for a Simkl entry."""
+    return str((entry.get("show") or {}).get("title") or "?")
+
+
+def _al_title(media: dict) -> str:
+    t = media.get("title") or {}
+    return str(t.get("romaji") or t.get("english") or f"anilist:{media.get('id')}")
+
+
+def _audit(header: str, lines: list[str], empty: str | None = None) -> None:
+    """Log a titled block, or one line when it is empty."""
+    if not lines:
+        if empty:
+            log.info("  %s", empty)
+        return
+    log.info("%s", header)
+    for line in lines:
+        log.info("    %s", line)
+
+
 # --------------------------------------------------------------------------- #
-# OUTBOUND: Simkl -> AniList (+ MAL)
+# OUTBOUND: to AniList / MAL
 # --------------------------------------------------------------------------- #
 def outbound_tick(
     cfg: Config, st: State, simkl: Simkl, anilist: AniList | None, mal: Mal | None
@@ -113,11 +127,9 @@ def outbound_tick(
     date_from = st.get("simkl_anime_cursor")
     blob = simkl.all_items("anime", date_from=date_from)
     entries = Simkl.anime_entries(blob)
-    log.info(
-        "simkl: %d anime entries changed since %s",
-        len(entries),
-        date_from or "the beginning",
-    )
+    log.info("OUTBOUND  to AniList/MAL")
+    log.info("  Simkl titles   : %d anime changed since %s",
+             len(entries), date_from or "the beginning")
 
     # One request: the current AniList state, so no write can regress it.
     current: dict[int, dict] = {}
@@ -127,10 +139,7 @@ def outbound_tick(
                 int((e.get("media") or {}).get("id") or 0): e
                 for e in anilist.list_entries()
             }
-            log.info(
-                "anilist: %d existing entries loaded for the regression guard",
-                len(current),
-            )
+            log.info("  AniList titles : %d already tracked", len(current))
         except Exception:
             log.exception(
                 "could not load AniList state - skipping this tick rather "
@@ -139,6 +148,10 @@ def outbound_tick(
             return
 
     skipped = 0
+    updates: list[str] = []
+    adds: list[str] = []
+    mal_writes: list[str] = []
+    unmatched: list[str] = []
 
     for e in entries:
         ids = Simkl.ids_of(e)
@@ -164,17 +177,10 @@ def outbound_tick(
                 media = anilist.by_mal(mal_id)
                 target = media["id"] if media else None
             if target is None:
-                log.warning(
-                    "no anilist entry for mal:%s (%s)",
-                    mal_id,
-                    (e.get("show") or {}).get("title"),
-                )
+                unmatched.append(f"{_title_of(e)}  (mal:{mal_id})")
             else:
-                # Simkl scores are whole numbers and often stale. AniList holds
-                # the authoritative 1dp rating (Floppy's, via the ratings tick),
-                # so Simkl must never supply one: passing None here is what
-                # makes "Simkl -> AniList pushes no ratings" true in code and
-                # not just in the README. Progress and status still flow.
+                # No score: Simkl's whole numbers must never overwrite an
+                # AniList decimal. Progress and status only.
                 decision = guard(current.get(int(target)), status, progress)
                 if decision is None:
                     skipped += 1
@@ -189,31 +195,27 @@ def outbound_tick(
                     # No score argument: Simkl never rates AniList.
                     anilist.save(target, status=g_status, progress=g_prog)
                     st.mark_written("anilist", key, signature)
-                    log.info(
-                        "anilist[%s] <- %s status=%s ep=%s | %s",
-                        target,
-                        why,
-                        g_status or "-",
-                        g_prog if g_prog is not None else "-",
-                        (e.get("show") or {}).get("title"),
-                    )
+                    have = current.get(int(target)) or {}
+                    bits = []
+                    if g_prog is not None:
+                        bits.append(f"progress ep{int(have.get('progress') or 0)} -> ep{g_prog}")
+                    if g_status:
+                        bits.append(f"status {have.get('status') or '-'} -> {g_status}")
+                    line = f"{_title_of(e):<45.45} {', '.join(bits)}"
+                    (adds if why == "new" else updates).append(line)
 
         if mal and cfg.enable_mal and mal_id and st.differs("mal", key, signature):
             mal.update(mal_id, status=status, progress=progress, score_1dp=score)
             st.mark_written("mal", key, signature)
-            log.info(
-                "mal[%s] <- %s ep%s score=%s | %s",
-                mal_id,
-                status,
-                progress,
-                score,
-                (e.get("show") or {}).get("title"),
-            )
+            mal_writes.append(f"{_title_of(e):<45.45} ep{progress} status={status} score={score}")
 
-    if skipped:
-        log.info(
-            "guard: %d writes suppressed - AniList already equal or better", skipped
-        )
+    _audit("  updating:", updates)
+    _audit("  adding titles:", adds)
+    _audit("  also mirrored to MAL:", mal_writes)
+    _audit("  no AniList entry - cannot write:", unmatched)
+    log.info("  unchanged      : %d already equal or better on AniList", skipped)
+    log.info("  result         : %d updated, %d added, %d unmatched",
+             len(updates), len(adds), len(unmatched))
     if newest:
         st.set("simkl_activity_all", newest)
         st.set("simkl_anime_cursor", newest)
@@ -221,7 +223,7 @@ def outbound_tick(
 
 
 # --------------------------------------------------------------------------- #
-# INBOUND: AniList -> Simkl  (the Seanime path)
+# INBOUND: to Simkl
 # --------------------------------------------------------------------------- #
 def inbound_tick(cfg: Config, st: State, simkl: Simkl, anilist: AniList | None) -> None:
     if not (anilist and cfg.enable_simkl_push):
@@ -253,18 +255,27 @@ def inbound_tick(cfg: Config, st: State, simkl: Simkl, anilist: AniList | None) 
         return
 
     changed = [e for e in entries if int(e.get("updatedAt") or 0) > seen]
-    log.info("anilist: %d entries changed since %s", len(changed), seen)
+    log.info("INBOUND   to Simkl")
+    log.info("  AniList titles : %d tracked, %d changed since cursor %s",
+             len(entries), len(changed), seen)
+    pushes: list[str] = []
+    no_mal: list[str] = []
+    already: int = 0
 
     for e in changed:
         media = e.get("media") or {}
         mal_id = media.get("idMal")
         if not mal_id:
+            # Simkl is keyed on MAL ids, so an AniList-only title has nowhere
+            # to go. Nothing is lost on AniList.
+            no_mal.append(_al_title(media))
             continue
         progress = int(e.get("progress") or 0)
         raw = e.get("scoreRaw")
         score = round(int(raw) / 10.0, 1) if raw else None
         signature = f"{e.get('status')}|{progress}|{score}"
         if not st.differs("simkl", str(mal_id), signature):
+            already += 1
             continue
 
         payload = {"anime": [{"ids": {"mal": int(mal_id)}}]}
@@ -285,7 +296,13 @@ def inbound_tick(cfg: Config, st: State, simkl: Simkl, anilist: AniList | None) 
                 }
             )
         st.mark_written("simkl", str(mal_id), signature)
-        log.info("simkl <- anilist mal:%s ep%s score=%s", mal_id, progress, score)
+        rating_note = f", rating {round(score)} (rounded from {score})" if score is not None else ""
+        pushes.append(f"{_al_title(media):<45.45} ep{progress} {e.get('status')}{rating_note}")
+
+    _audit("  pushing to Simkl:", pushes)
+    _audit("  no MAL id - cannot reach Simkl:", no_mal)
+    log.info("  unchanged      : %d already pushed with the same values", already)
+    log.info("  result         : %d pushed, %d unreachable", len(pushes), len(no_mal))
 
     st.set("anilist_updated_at", newest)
     st.save()
@@ -304,10 +321,8 @@ def plan_ratings(
     Returns (to_anilist, to_floppy, conflicts) where the first two are lists of
     (mal_id, score) and conflicts is (mal_id, floppy_score, anilist_score, winner).
 
-    Both sides hold one decimal place, so a score moves either way untouched.
-    Filling a gap is unambiguous and always happens. A genuine disagreement is
-    not: two different numbers mean a human entered both, so `winner` defaults
-    to "skip", which reports the clash and writes nothing.
+    Filling a gap always happens. A disagreement means two numbers were entered
+    by hand, so `winner` defaults to "skip" - report it, write nothing.
     """
     to_anilist: list[tuple[int, float]] = []
     to_floppy: list[tuple[int, float]] = []
@@ -353,44 +368,37 @@ def ratings_tick(cfg: Config, st: State, floppy, anilist: AniList | None) -> Non
         if id_mal:
             anilist_by_mal[int(id_mal)] = e
 
-    log.info(
-        "ratings: floppy=%d rated, anilist=%d entries (%d with a mal id)",
-        len(floppy_scores),
-        len(entries),
-        len(anilist_by_mal),
-    )
+    rated_al = sum(1 for e in anilist_by_mal.values() if e.get("scoreRaw"))
+    comparable = len(set(floppy_scores) | {m for m, e in anilist_by_mal.items() if e.get("scoreRaw")})
+    log.info("RATINGS   Floppy <-> AniList")
+    log.info("  Floppy         : %d rated", len(floppy_scores))
+    log.info("  AniList        : %d entries, %d with a MAL id, %d rated",
+             len(entries), len(anilist_by_mal), rated_al)
+    log.info("  comparable     : %d titles rated on at least one side", comparable)
 
     to_anilist, to_floppy, conflicts = plan_ratings(
         floppy_scores, anilist_by_mal, cfg.ratings_winner
     )
 
-    for mal_id, f_score, a_score, won_by in conflicts:
-        if won_by == "skip":
-            log.warning(
-                "ratings disagree mal:%s floppy=%s anilist=%s - writing "
-                "neither. Fix it on one side, or set RATINGS_WINNER.",
-                mal_id,
-                f_score,
-                a_score,
-            )
-        else:
-            log.info(
-                "ratings conflict mal:%s floppy=%s anilist=%s -> %s wins",
-                mal_id,
-                f_score,
-                a_score,
-                won_by,
-            )
+    if conflicts:
+        log.info("  disagreements:")
+        for mal_id, f_score, a_score, won_by in conflicts:
+            title = _al_title((anilist_by_mal.get(mal_id) or {}).get("media") or {})
+            if won_by == "skip":
+                log.warning("    %-45.45s floppy=%s anilist=%s  WRITING NEITHER "
+                            "(set RATINGS_WINNER to resolve)", title, f_score, a_score)
+            else:
+                log.info("    %-45.45s floppy=%s anilist=%s -> %s wins",
+                         title, f_score, a_score, won_by)
 
     unmatched = set(floppy_scores) - set(anilist_by_mal)
     if unmatched:
-        log.info(
-            "ratings: %d rated anime in Floppy have no AniList list entry "
-            "- add them on AniList first",
-            len(unmatched),
-        )
+        log.info("  %d rated in Floppy with no AniList entry - add them on AniList first",
+                 len(unmatched))
 
     wrote = 0
+    to_al_lines: list[str] = []
+    to_fl_lines: list[str] = []
     for mal_id, score in to_anilist:
         signature = f"score={score}"
         if not st.differs("floppy_to_anilist", str(mal_id), signature):
@@ -402,12 +410,7 @@ def ratings_tick(cfg: Config, st: State, floppy, anilist: AniList | None) -> Non
         anilist.save(int(media_id), score_1dp=score)
         st.mark_written("floppy_to_anilist", str(mal_id), signature)
         wrote += 1
-        log.info(
-            "anilist[%s] <- floppy score=%s | %s",
-            media_id,
-            score,
-            (media.get("title") or {}).get("romaji"),
-        )
+        to_al_lines.append(f"{_al_title(media):<45.45} rating -> {score}  (AniList)")
 
     for mal_id, score in to_floppy:
         signature = f"score={score}"
@@ -416,10 +419,13 @@ def ratings_tick(cfg: Config, st: State, floppy, anilist: AniList | None) -> Non
         floppy.set_score(mal_id, score)
         st.mark_written("anilist_to_floppy", str(mal_id), signature)
         wrote += 1
-        log.info("floppy[mal:%s] <- anilist score=%s", mal_id, score)
+        title = _al_title((anilist_by_mal.get(mal_id) or {}).get("media") or {})
+        to_fl_lines.append(f"{title:<45.45} rating -> {score}  (Floppy)")
 
-    if not wrote:
-        log.debug("ratings: nothing to write")
+    _audit("  updating:", to_al_lines + to_fl_lines,
+           empty="nothing to write - both sides already agree")
+    log.info("  result         : %d written, %d disagreements left alone",
+             wrote, sum(1 for c in conflicts if c[3] == "skip"))
     st.save()
 
 

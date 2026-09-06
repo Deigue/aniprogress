@@ -1,14 +1,9 @@
 """Floppy client — anime ratings only.
 
-Floppy stores anime as flat rows keyed by MAL id (`source: "mal"`), which is the
-same key AniList exposes as `idMal`. So the two libraries join directly, with no
-title matching and no TMDB in the path.
+Floppy keys anime by MAL id, the same id AniList exposes as `idMal`, so the two
+join directly. Both hold 1dp, so a rating moves either way unrounded.
 
-Scores are 0–10 with one decimal place on both sides, so a rating moves between
-them without being rounded. That is the whole point of this module: it is the
-only pair in the project where ratings travel in *both* directions.
-
-Standard library only, to keep the image dependency-free.
+Standard library only.
 """
 from __future__ import annotations
 
@@ -27,10 +22,7 @@ MAX_PAGES = 200
 
 
 def score_1dp(raw: Any) -> float | None:
-    """Normalise a score to one decimal place, or None when unrated.
-
-    Floppy stores 0 for 'no rating', which must not be confused with a real 0.
-    """
+    """Score to 1dp, or None when unrated. Floppy stores 0 for 'no rating'."""
     try:
         v = float(raw)
     except (TypeError, ValueError):
@@ -77,11 +69,10 @@ class Floppy:
 
     # --- reads ---------------------------------------------------------------
     def _paged(self, path: str, params: dict | None = None) -> Iterator[dict]:
-        """Walk a Floppy list endpoint.
+        """Walk a list endpoint.
 
-        The envelope is {"pagination": {"total", "limit", "offset", "next",
-        "previous"}, "results": [...]} - note `total`, not `count`, and the
-        absence of `next` is the authoritative end-of-list signal.
+        Envelope is {"pagination": {...,"next"}, "results": [...]} - `total`,
+        not `count`, and a missing `next` ends the walk.
         """
         offset = 0
         for _ in range(MAX_PAGES):
@@ -103,8 +94,8 @@ class Floppy:
     def _identity(row: dict) -> tuple[str, str] | None:
         """(source, media_id) for a list row.
 
-        Both live on the nested `item`, not on the row itself. `item_id` carries
-        the same thing as "anime/mal/10020" and is the fallback.
+        Both live on the nested `item`, not the row. `item_id` ("anime/mal/10020")
+        is the fallback.
         """
         item = row.get("item")
         if isinstance(item, dict):
@@ -118,11 +109,7 @@ class Floppy:
         return None
 
     def anime_scores(self) -> dict[int, float]:
-        """MAL id -> score, for every rated anime in the library.
-
-        Unrated rows are omitted rather than returned as 0, so callers can tell
-        'no rating' from 'rated zero' without a sentinel.
-        """
+        """MAL id -> score for every rated anime. Unrated rows are omitted."""
         out: dict[int, float] = {}
         rows = 0
         skipped_source = 0
@@ -152,11 +139,7 @@ class Floppy:
 
     # --- writes --------------------------------------------------------------
     def set_score(self, mal_id: int, score_1dp_value: float) -> dict:
-        """Write a 1dp score onto a MAL-keyed anime row.
-
-        PATCH on the anime endpoint accepts score/progress/status - unlike the
-        TV form, which silently discards anything outside score/status/notes.
-        """
+        """Write a 1dp score. The anime endpoint accepts score/progress/status."""
         payload = {"score": round(float(score_1dp_value), 1)}
         if self.dry_run:
             log.info("[dry-run] floppy PATCH media/anime/mal/%s %s", mal_id, payload)

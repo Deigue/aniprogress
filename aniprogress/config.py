@@ -6,13 +6,9 @@ from dataclasses import dataclass, field
 
 
 def load_dotenv(path: str = ".env") -> int:
-    """Read a .env file into the environment, without overriding what is set.
+    """Read .env into the environment without overriding what is already set.
 
-    Under Docker the environment already carries everything (`env_file:` /
-    `environment:`), so this is a no-op there. It exists so a local run behaves
-    the same way as the container without exporting six variables by hand.
-    Anything already in os.environ wins, so an explicit override on the command
-    line still beats the file.
+    A no-op under Docker, where env_file/environment already populated it.
     """
     if not os.path.isfile(path):
         return 0
@@ -64,12 +60,8 @@ class Config:
     enable_simkl_push: bool = field(default_factory=lambda: _b("ENABLE_SIMKL_PUSH", "true"))
     enable_floppy_ratings: bool = field(default_factory=lambda: _b("ENABLE_FLOPPY_RATINGS", "false"))
 
-    # What to do when Floppy and AniList both hold a rating and they disagree.
-    #
-    # The default refuses to guess: both values are logged and neither is
-    # written. A disagreement means a human set two different numbers, and
-    # silently discarding one of them is worse than leaving the pair out of
-    # sync until someone decides. Set "floppy" or "anilist" to pick a winner.
+    # Floppy and AniList disagree on a rating: "skip" logs both and writes
+    # neither, "floppy"/"anilist" picks a winner.
     ratings_winner: str = field(
         default_factory=lambda: os.environ.get("RATINGS_WINNER", "skip").strip().lower())
 

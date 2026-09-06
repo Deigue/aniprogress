@@ -7,15 +7,19 @@ Keeps anime **progress, watchlist status and ratings** in sync between **Simkl**
 
 **Progress and watchlist**
 
-- **Simkl → AniList / MAL** — your player scrobbles to Simkl; AniList and MAL follow.
-- **AniList → Simkl** — the same, back the other way, for players that write straight to AniList.
+- **Outbound to AniList / MAL** — your player scrobbles to Simkl; AniList and MAL follow.
+  Progress and status only.
+- **Inbound to Simkl** — for players that write straight to AniList.
+
+It does not write progress into Floppy. Floppy has its own scheduled Simkl import, and a second
+writer would just race it for the same rows.
 
 **Ratings**
 
 | Direction        | Behaviour                                       |
 | ---------------- | ----------------------------------------------- |
-| AniList → Simkl  | moves ratings, **rounded** to a whole number    |
-| Simkl → AniList  | **no ratings pushed**                           |
+| Inbound to Simkl | moves ratings, **rounded** to a whole number    |
+| Outbound to AniList | **no ratings pushed** — Simkl cannot hold a decimal |
 | Floppy ↔ AniList | syncs ratings **both ways, decimals preserved** |
 
 Between Floppy and AniList, a missing rating is filled in from whichever side has one. If the two
