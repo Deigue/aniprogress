@@ -130,6 +130,21 @@ def update_simkl_snapshot(st: State, entries: list[dict]) -> int:
     return len(entries)
 
 
+def _snap_write(st: State, mal_id: int, progress: int, status: str, rating) -> None:
+    """Fold a write we just made into the Simkl snapshot.
+
+    INBOUND writes to Simkl but only OUTBOUND reads it back, so without this the
+    same titles are reported as pending on every tick.
+    """
+    snap = dict(simkl_snapshot(st))
+    snap[str(int(mal_id))] = {
+        "progress": int(progress),
+        "status": status,
+        "rating": rating,
+    }
+    st.set("simkl_anime", snap)
+
+
 def _remember(cfg: Config, st: State, target: str, key: str, signature) -> None:
     """Record a write, unless this was a dry run.
 
@@ -343,6 +358,7 @@ def inbound_tick(cfg: Config, st: State, simkl: Simkl, anilist: AniList | None) 
         return
 
     changed = []
+    to_plan: list[dict] = []
     unknown = 0
     for e in entries:
         id_mal = (e.get("media") or {}).get("idMal")
@@ -350,14 +366,18 @@ def inbound_tick(cfg: Config, st: State, simkl: Simkl, anilist: AniList | None) 
             continue
         progress = int(e.get("progress") or 0)
 
-        # Nothing watched means nothing to push. This is the incident guard:
-        # add_history with a bare {"ids": {...}} and no episodes tells Simkl to
-        # mark the WHOLE show watched, which is how a shelf of plan-to-watch
-        # titles became COMPLETED and then propagated back onto AniList.
+        have = snap.get(str(int(id_mal)))
+
+        # Nothing watched means nothing to add to history. add_history with a
+        # bare {"ids": {...}} tells Simkl to mark the WHOLE show watched, which
+        # is how a shelf of plan-to-watch titles became COMPLETED. A genuinely
+        # new plan-to-watch title still belongs on Simkl - it just goes on the
+        # list rather than into history.
         if progress <= 0:
+            if have is None and str(e.get("status")) == "PLANNING":
+                to_plan.append(e)
             continue
 
-        have = snap.get(str(int(id_mal)))
         if have is None:
             # Absent from Simkl is not evidence that it was watched. Adding it
             # here is what let one bad inference reach two services at once.
@@ -374,7 +394,7 @@ def inbound_tick(cfg: Config, st: State, simkl: Simkl, anilist: AniList | None) 
     if unknown:
         log.info("  %d AniList title(s) Simkl has never seen - not pushed", unknown)
 
-    if not changed:
+    if not (changed or to_plan):
         log.info("INBOUND from AniList/MAL (no changes found)")
         return
     log.info("INBOUND from AniList/MAL")
@@ -404,11 +424,13 @@ def inbound_tick(cfg: Config, st: State, simkl: Simkl, anilist: AniList | None) 
             already += 1
             continue
 
-        payload = {"anime": [{"ids": {"mal": int(mal_id)}}]}
-        if progress:
-            payload["anime"][0]["episodes"] = [
-                {"number": n} for n in range(1, progress + 1)
-            ]
+        # Always an explicit episode list. A bare id means "the whole show".
+        payload = {
+            "anime": [{
+                "ids": {"mal": int(mal_id)},
+                "episodes": [{"number": n} for n in range(1, progress + 1)],
+            }]
+        }
         simkl.add_history(payload)
         if score is not None:
             simkl.add_rating(
@@ -422,10 +444,32 @@ def inbound_tick(cfg: Config, st: State, simkl: Simkl, anilist: AniList | None) 
                 }
             )
         _remember(cfg, st, "simkl", str(mal_id), signature)
+        # Record what we just sent, so the next tick does not re-detect it as
+        # pending. Without this the same titles are reported every tick forever:
+        # only OUTBOUND refreshes the snapshot, and its incremental read does
+        # not necessarily surface a write we made ourselves. If Simkl rejected
+        # it, the next OUTBOUND read corrects this back.
+        if not cfg.dry_run:
+            _snap_write(st, mal_id, progress, str(e.get("status") or ""), score)
         note = f" rating {round(score)} (from {score})" if score is not None else ""
         pushes.append(f"{_al_title(media)} (ep{progress} {e.get('status')}{note})")
 
-    if not (pushes or no_mal):
+    # Plan-to-watch titles go on the list, never through history.
+    planned: list[str] = []
+    for e in to_plan:
+        media = e.get("media") or {}
+        mal_id = media.get("idMal")
+        simkl.add_to_list(
+            {"anime": [{"ids": {"mal": int(mal_id)}, "to": "plantowatch"}]}
+        )
+        if not cfg.dry_run:
+            _snap_write(st, int(mal_id), 0, "plantowatch", None)
+        planned.append(f"{_al_title(media)} (plan to watch)")
+
+    if planned:
+        _audit("  adding to Simkl's plan-to-watch:", planned)
+
+    if not (pushes or no_mal or planned):
         log.info("  nothing to write - %d already pushed", already)
     else:
         _audit("  pushing to Simkl:", pushes)

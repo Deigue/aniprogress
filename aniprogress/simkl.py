@@ -84,6 +84,18 @@ class Simkl:
             return {"dry_run": True}
         return self._req("POST", "/sync/history", body=payload)
 
+    def add_to_list(self, payload: dict) -> Any:
+        """POST /sync/add-to-list - put a title on a list without watching it.
+
+        This is the safe way to bring a plan-to-watch title across. /sync/history
+        marks episodes watched; a bare id there marks the WHOLE show watched,
+        which is what caused the 2026-09-07 incident.
+        """
+        if self.dry_run:
+            log.debug("[dry-run] simkl add_to_list %s", json.dumps(payload)[:400])
+            return {"dry_run": True}
+        return self._req("POST", "/sync/add-to-list", body=payload)
+
     def remove_history(self, payload: dict) -> Any:
         """POST /sync/history/remove - same payload shape as add_history.
 
