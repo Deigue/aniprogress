@@ -82,6 +82,16 @@ def guard(have: dict | None, status, progress):
     return out_status, out_prog, "improve"
 
 
+def _remember(cfg: Config, st: State, target: str, key: str, signature) -> None:
+    """Record a write, unless this was a dry run.
+
+    A dry run performs no write, so recording one makes every later tick skip a
+    change that never happened - and the log stops reporting pending work.
+    """
+    if not cfg.dry_run:
+        st.mark_written(target, key, signature)
+
+
 def _int_or_none(v):
     try:
         return int(v)
@@ -190,7 +200,7 @@ def outbound_tick(
                 decision = guard(current.get(int(target)), status, progress)
                 if decision is None:
                     skipped += 1
-                    st.mark_written("anilist", key, signature)
+                    _remember(cfg, st, "anilist", key, signature)
                     log.debug(
                         "anilist[%s] no-op, target already equal or better | %s",
                         target,
@@ -200,7 +210,7 @@ def outbound_tick(
                     g_status, g_prog, why = decision
                     # No score argument: Simkl never rates AniList.
                     anilist.save(target, status=g_status, progress=g_prog)
-                    st.mark_written("anilist", key, signature)
+                    _remember(cfg, st, "anilist", key, signature)
                     have = current.get(int(target)) or {}
                     bits = []
                     if g_prog is not None:
@@ -213,7 +223,7 @@ def outbound_tick(
 
         if mal and cfg.enable_mal and mal_id and st.differs("mal", key, signature):
             mal.update(mal_id, status=status, progress=progress, score_1dp=score)
-            st.mark_written("mal", key, signature)
+            _remember(cfg, st, "mal", key, signature)
             note = f" score={round(score)}" if score is not None else ""
             mal_writes.append(f"{_title_of(e)} (ep{progress} {status}{note})")
 
@@ -311,7 +321,7 @@ def inbound_tick(cfg: Config, st: State, simkl: Simkl, anilist: AniList | None) 
                     ]
                 }
             )
-        st.mark_written("simkl", str(mal_id), signature)
+        _remember(cfg, st, "simkl", str(mal_id), signature)
         note = f" rating {round(score)} (from {score})" if score is not None else ""
         pushes.append(f"{_al_title(media)} (ep{progress} {e.get('status')}{note})")
 
@@ -425,7 +435,7 @@ def ratings_tick(cfg: Config, st: State, floppy, anilist: AniList | None) -> Non
         if not media_id:
             continue
         anilist.save(int(media_id), score_1dp=score)
-        st.mark_written("floppy_to_anilist", str(mal_id), signature)
+        _remember(cfg, st, "floppy_to_anilist", str(mal_id), signature)
         wrote += 1
         to_al_lines.append(f"{_al_title(media)} (rating -> {score} on AniList)")
 
@@ -434,21 +444,19 @@ def ratings_tick(cfg: Config, st: State, floppy, anilist: AniList | None) -> Non
         if not st.differs("anilist_to_floppy", str(mal_id), signature):
             continue
         floppy.set_score(mal_id, score)
-        st.mark_written("anilist_to_floppy", str(mal_id), signature)
+        _remember(cfg, st, "anilist_to_floppy", str(mal_id), signature)
         wrote += 1
         title = _al_title((anilist_by_mal.get(mal_id) or {}).get("media") or {})
-        to_fl_lines.append(f"{title:<45.45} rating -> {score}  (Floppy)")
+        to_fl_lines.append(f"{title} (rating -> {score} on Floppy)")
 
-    _audit(
-        "  updating:",
-        to_al_lines + to_fl_lines,
-        empty="nothing to write - both sides already agree",
-    )
-    log.info(
-        "  result         : %d written, %d disagreements left alone",
-        wrote,
-        sum(1 for c in conflicts if c[3] == "skip"),
-    )
+    unresolved = sum(1 for c in conflicts if c[3] == "skip")
+    if to_al_lines or to_fl_lines:
+        _audit("  updating:", to_al_lines + to_fl_lines)
+    elif unresolved:
+        log.info("  no writes - %d disagreement(s) need a decision", unresolved)
+    else:
+        log.info("  no writes - both sides already agree")
+    log.info("  %d written, %d unresolved", wrote, unresolved)
     st.save()
 
 
