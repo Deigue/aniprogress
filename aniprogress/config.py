@@ -70,6 +70,13 @@ class Config:
     poll_in_seconds: int = field(default_factory=lambda: _i("POLL_IN_SECONDS", 600))
     poll_ratings_seconds: int = field(default_factory=lambda: _i("POLL_RATINGS_SECONDS", 900))
 
+    # The date_from used the very first time, before a cursor exists. Simkl
+    # filters on last-modified, not watch date, so any item in the account was
+    # touched after the account existed - an early floor returns everything
+    # while still passing date_from, which is what Simkl's docs require.
+    simkl_epoch: str = field(
+        default_factory=lambda: os.environ.get("SIMKL_EPOCH", "2010-01-01T00:00:00Z"))
+
     dry_run: bool = field(default_factory=lambda: _b("DRY_RUN", "true"))
     state_dir: str = field(default_factory=lambda: os.environ.get("STATE_DIR", "/data"))
     log_level: str = field(default_factory=lambda: os.environ.get("LOG_LEVEL", "INFO").upper())

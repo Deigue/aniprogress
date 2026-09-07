@@ -82,6 +82,37 @@ def guard(have: dict | None, status, progress):
     return out_status, out_prog, "improve"
 
 
+def simkl_snapshot(st: State) -> dict[str, dict]:
+    """What we last saw in Simkl, keyed by MAL id.
+
+    Built once from an epoch-anchored read and kept current from the same
+    incremental pulls OUTBOUND already makes, so nothing ever has to call
+    all_items without a date_from. INBOUND diffs against this instead of
+    guessing from a cursor, which is what lets it report the exact writes it
+    intends rather than pushing the whole list and letting Simkl drop the
+    duplicates silently.
+    """
+    snap = st.get("simkl_anime") or {}
+    return snap if isinstance(snap, dict) else {}
+
+
+def update_simkl_snapshot(st: State, entries: list[dict]) -> int:
+    """Merge an incremental Simkl pull into the snapshot. Returns rows touched."""
+    snap = dict(simkl_snapshot(st))
+    for e in entries:
+        ids = Simkl.ids_of(e)
+        mal_id = _int_or_none(ids.get("mal"))
+        if mal_id is None:
+            continue
+        snap[str(mal_id)] = {
+            "progress": _progress_of(e),
+            "status": str(e.get("status") or ""),
+            "rating": _score_1dp(e.get("user_rating")),
+        }
+    st.set("simkl_anime", snap)
+    return len(entries)
+
+
 def _remember(cfg: Config, st: State, target: str, key: str, signature) -> None:
     """Record a write, unless this was a dry run.
 
@@ -126,6 +157,8 @@ def _audit(header: str, lines: list[str], empty: str | None = None) -> None:
 def outbound_tick(
     cfg: Config, st: State, simkl: Simkl, anilist: AniList | None, mal: Mal | None
 ) -> None:
+    if not (cfg.enable_anilist or cfg.enable_mal):
+        return
     acts = simkl.activities()
     if not acts:
         return
@@ -134,7 +167,11 @@ def outbound_tick(
         log.info("OUTBOUND to AniList/MAL (no changes found)")
         return
 
-    date_from = st.get("simkl_anime_cursor")
+    # Never call all_items without a date_from - Simkl's docs are explicit that
+    # it gets the client_id suspended. With no cursor yet, fall back to the
+    # configured epoch: still a date_from, and it returns the whole library once
+    # so the snapshot below starts complete.
+    date_from = st.get("simkl_anime_cursor") or cfg.simkl_epoch
     blob = simkl.all_items("anime", date_from=date_from)
     entries = Simkl.anime_entries(blob)
     if not entries:
@@ -145,7 +182,10 @@ def outbound_tick(
             st.save()
         return
     log.info("OUTBOUND to AniList/MAL")
-    log.info("  Simkl: %d changed since %s", len(entries), date_from or "the beginning")
+    log.info("  Simkl: %d changed since %s", len(entries), date_from)
+    # Keep the shared picture of Simkl current from this same pull, so INBOUND
+    # never needs a read of its own.
+    update_simkl_snapshot(st, entries)
 
     # One request: the current AniList state, so no write can regress it.
     current: dict[int, dict] = {}
@@ -254,36 +294,42 @@ def inbound_tick(cfg: Config, st: State, simkl: Simkl, anilist: AniList | None) 
     entries = anilist.list_entries()  # ONE request, whole list
     if not entries:
         return
-    newest = max(int(e.get("updatedAt") or 0) for e in entries)
-    seen = int(st.get("anilist_updated_at") or 0)
-
-    if seen == 0:
-        # First run: every entry looks "changed" because there is no cursor yet.
-        # Pushing all of them would fire hundreds of Simkl writes for data Simkl
-        # very likely already has. Record the watermark and start reacting from
-        # the next real change instead.
-        st.set("anilist_updated_at", newest)
-        st.save()
+    # Diff against what Simkl actually holds, not against a cursor. The snapshot
+    # is maintained by OUTBOUND's incremental pulls, so this costs no Simkl read
+    # and reports the exact writes it intends rather than pushing the whole list
+    # and letting Simkl drop the duplicates in silence.
+    snap = simkl_snapshot(st)
+    if not snap:
         log.info(
-            "inbound: seeded cursor at updatedAt=%s from %d entries "
-            "(no writes on first run)",
-            newest,
-            len(entries),
+            "INBOUND from AniList/MAL (waiting - no Simkl snapshot yet, "
+            "the next OUTBOUND tick builds it)"
         )
         return
 
-    if newest <= seen:
-        log.info("INBOUND from AniList/MAL (no changes found)")
-        return
+    changed = []
+    for e in entries:
+        id_mal = (e.get("media") or {}).get("idMal")
+        if not id_mal:
+            continue
+        have = snap.get(str(int(id_mal)))
+        if have is None:
+            changed.append(e)  # Simkl has never seen it
+            continue
+        raw = e.get("scoreRaw")
+        score = round(int(raw) / 10.0, 1) if raw else None
+        if int(e.get("progress") or 0) > int(have.get("progress") or 0):
+            changed.append(e)
+        elif score is not None and have.get("rating") is None:
+            changed.append(e)
 
-    changed = [e for e in entries if int(e.get("updatedAt") or 0) > seen]
     if not changed:
         log.info("INBOUND from AniList/MAL (no changes found)")
-        st.set("anilist_updated_at", newest)
-        st.save()
         return
     log.info("INBOUND from AniList/MAL")
-    log.info("  AniList: %d tracked, %d changed", len(entries), len(changed))
+    log.info(
+        "  AniList: %d tracked, Simkl: %d known, %d to push",
+        len(entries), len(snap), len(changed),
+    )
     pushes: list[str] = []
     no_mal: list[str] = []
     already: int = 0
@@ -333,7 +379,8 @@ def inbound_tick(cfg: Config, st: State, simkl: Simkl, anilist: AniList | None) 
         log.info(
             "  %d pushed, %d unreachable, %d unchanged", len(pushes), len(no_mal), already
         )
-    st.set("anilist_updated_at", newest)
+    # The snapshot is updated by OUTBOUND, so nothing to persist here beyond
+    # what the writes themselves recorded.
     st.save()
 
 
@@ -385,7 +432,12 @@ def plan_ratings(
     return to_anilist, to_floppy, conflicts
 
 
-def ratings_tick(cfg: Config, st: State, floppy, anilist: AniList | None) -> None:
+def ratings_tick(
+    cfg: Config, st: State, floppy, anilist: AniList | None, mal: Mal | None = None
+) -> None:
+    # AniList is required as the comparison partner: it is the only anime
+    # tracker with a list-read API here, so it is the only one whose ratings can
+    # be compared against Floppy's. MAL rides along as a write-only mirror.
     if not (floppy and anilist and cfg.enable_floppy_ratings and cfg.enable_anilist):
         return
 
@@ -406,7 +458,8 @@ def ratings_tick(cfg: Config, st: State, floppy, anilist: AniList | None) -> Non
     )
     unmatched = set(floppy_scores) - set(anilist_by_mal)
 
-    if not (to_anilist or to_floppy or conflicts):
+    mirror_to_mal = bool(mal and cfg.enable_mal)
+    if not (to_anilist or to_floppy or conflicts or mirror_to_mal):
         log.info("RATINGS Floppy <-> AniList (no changes found)")
         return
 
@@ -423,35 +476,46 @@ def ratings_tick(cfg: Config, st: State, floppy, anilist: AniList | None) -> Non
     if unmatched:
         log.info("  %d rated in Floppy with no AniList entry", len(unmatched))
 
+    # No dedup state here, deliberately. Both libraries are read in full every
+    # tick, so the comparison IS the dedup: once a write lands the two sides
+    # agree and the next tick finds nothing. A state file could only disagree
+    # with reality - and did, masking a pending write because an earlier dry run
+    # had recorded it as done.
     wrote = 0
     to_al_lines: list[str] = []
     to_fl_lines: list[str] = []
     for mal_id, score in to_anilist:
-        signature = f"score={score}"
-        if not st.differs("floppy_to_anilist", str(mal_id), signature):
-            continue
         media = anilist_by_mal[mal_id].get("media") or {}
         media_id = media.get("id")
         if not media_id:
             continue
         anilist.save(int(media_id), score_1dp=score)
-        _remember(cfg, st, "floppy_to_anilist", str(mal_id), signature)
         wrote += 1
         to_al_lines.append(f"{_al_title(media)} (rating -> {score} on AniList)")
 
     for mal_id, score in to_floppy:
-        signature = f"score={score}"
-        if not st.differs("anilist_to_floppy", str(mal_id), signature):
-            continue
         floppy.set_score(mal_id, score)
-        _remember(cfg, st, "anilist_to_floppy", str(mal_id), signature)
         wrote += 1
         title = _al_title((anilist_by_mal.get(mal_id) or {}).get("media") or {})
         to_fl_lines.append(f"{title} (rating -> {score} on Floppy)")
 
+    # MAL cannot be compared - it has no list read here - so it is mirrored:
+    # every rating either side agreed on is pushed, rounded.
+    to_mal_lines: list[str] = []
+    if mal and cfg.enable_mal:
+        settled = dict(floppy_scores)
+        settled.update({m: s for m, s in to_floppy})
+        settled.update({m: s for m, s in to_anilist})
+        for mal_id, score in sorted(settled.items()):
+            entry = anilist_by_mal.get(mal_id)
+            title = _al_title((entry or {}).get("media") or {}) if entry else f"mal:{mal_id}"
+            mal.update(mal_id, score_1dp=score)
+            to_mal_lines.append(f"{title} (rating -> {round(score)} on MAL, from {score})")
+
     unresolved = sum(1 for c in conflicts if c[3] == "skip")
-    if to_al_lines or to_fl_lines:
+    if to_al_lines or to_fl_lines or to_mal_lines:
         _audit("  updating:", to_al_lines + to_fl_lines)
+        _audit("  mirrored to MAL:", to_mal_lines)
     elif unresolved:
         log.info("  no writes - %d disagreement(s) need a decision", unresolved)
     else:
@@ -559,7 +623,7 @@ def main() -> int:
                 daemon=True,
                 args=(
                     "ratings",
-                    lambda: ratings_tick(cfg, st, floppy, anilist),
+                    lambda: ratings_tick(cfg, st, floppy, anilist, mal),
                     cfg.poll_ratings_seconds,
                 ),
             )

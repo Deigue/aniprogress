@@ -141,10 +141,31 @@ def test_tick_and_idempotence() -> None:
     check("anilist received 2 writes", sorted(al.writes), [(2001, 8.7), (2004, 7.8)])
     check("floppy received 1 write", fl.writes, [(102, 6.4)])
 
+    # Idempotence comes from the data converging, not from a remembered write.
+    # There is deliberately no dedup state: a state file can disagree with
+    # reality, and did - a dry run recorded writes it never made, after which
+    # every later tick reported "nothing to do" for a pending change.
+    # So apply the writes to the fakes, exactly as the real services would.
+    for media_id, score in al.writes:
+        for e in ANILIST_ENTRIES:
+            if e["media"]["id"] == media_id:
+                e["scoreRaw"] = int(round(score * 10))
+    for mal_id, score in fl.writes:
+        fl._scores[mal_id] = score
+
     n_al, n_fl = len(al.writes), len(fl.writes)
     ratings_tick(cfg, st, fl, al)
-    check("second pass wrote nothing to anilist", len(al.writes) - n_al, 0)
-    check("second pass wrote nothing to floppy", len(fl.writes) - n_fl, 0)
+    check("once both sides agree, anilist gets nothing", len(al.writes) - n_al, 0)
+    check("once both sides agree, floppy gets nothing", len(fl.writes) - n_fl, 0)
+
+    # And the converse: an unresolved gap must be re-reported every tick, not
+    # silently swallowed because a previous tick already saw it.
+    fl2, al2 = FakeFloppy({601: 9.0}), FakeAniList([al_entry(6001, 601, None, "Gap")])
+    st2 = State(os.path.join(tempfile.mkdtemp(), "state.json"))
+    ratings_tick(cfg, st2, fl2, al2)
+    first = len(al2.writes)
+    ratings_tick(cfg, st2, fl2, al2)
+    check("an unapplied change is reported again next tick", len(al2.writes), first * 2)
 
 
 def test_decimals_survive() -> None:
