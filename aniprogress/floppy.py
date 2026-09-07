@@ -142,6 +142,7 @@ class Floppy:
         """Write a 1dp score. The anime endpoint accepts score/progress/status."""
         payload = {"score": round(float(score_1dp_value), 1)}
         if self.dry_run:
-            log.info("[dry-run] floppy PATCH media/anime/mal/%s %s", mal_id, payload)
+            # Summarised one line per title by the caller's audit block.
+            log.debug("[dry-run] floppy PATCH media/anime/mal/%s %s", mal_id, payload)
             return {"dry_run": True}
         return self._request("PATCH", f"media/anime/mal/{int(mal_id)}", body=payload) or {}

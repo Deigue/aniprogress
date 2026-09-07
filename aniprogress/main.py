@@ -163,29 +163,45 @@ def outbound_tick(
     if not acts:
         return
     newest = acts.get("all") or ""
-    if newest and newest == st.get("simkl_activity_all"):
+
+    # The snapshot is what INBOUND diffs against, so it has to exist before the
+    # activity gate is allowed to skip anything. Without this, a state file
+    # carrying an old simkl_activity_all makes OUTBOUND return early forever and
+    # INBOUND wait forever for a snapshot that is never built.
+    # An explicit marker, not "is the dict non-empty": a library with no anime
+    # would otherwise look unbuilt forever and re-read from the epoch each tick.
+    have_snapshot = bool(st.get("simkl_snapshot_at"))
+
+    if have_snapshot and newest and newest == st.get("simkl_activity_all"):
         log.info("OUTBOUND to AniList/MAL (no changes found)")
         return
 
     # Never call all_items without a date_from - Simkl's docs are explicit that
-    # it gets the client_id suspended. With no cursor yet, fall back to the
-    # configured epoch: still a date_from, and it returns the whole library once
-    # so the snapshot below starts complete.
-    date_from = st.get("simkl_anime_cursor") or cfg.simkl_epoch
+    # it gets the client_id suspended. With no snapshot yet, read from the epoch
+    # so the picture starts complete; afterwards follow the cursor.
+    date_from = (
+        cfg.simkl_epoch
+        if not have_snapshot
+        else (st.get("simkl_anime_cursor") or cfg.simkl_epoch)
+    )
+    if not have_snapshot:
+        log.info("OUTBOUND building the first Simkl snapshot from %s", date_from)
     blob = simkl.all_items("anime", date_from=date_from)
     entries = Simkl.anime_entries(blob)
     if not entries:
         log.info("OUTBOUND to AniList/MAL (no changes found)")
+        st.set("simkl_snapshot_at", newest or date_from)
         if newest:
             st.set("simkl_activity_all", newest)
             st.set("simkl_anime_cursor", newest)
-            st.save()
+        st.save()
         return
     log.info("OUTBOUND to AniList/MAL")
     log.info("  Simkl: %d changed since %s", len(entries), date_from)
     # Keep the shared picture of Simkl current from this same pull, so INBOUND
     # never needs a read of its own.
     update_simkl_snapshot(st, entries)
+    st.set("simkl_snapshot_at", newest or date_from)
 
     # One request: the current AniList state, so no write can regress it.
     current: dict[int, dict] = {}
@@ -253,7 +269,7 @@ def outbound_tick(
                     _remember(cfg, st, "anilist", key, signature)
                     have = current.get(int(target)) or {}
                     bits = []
-                    if g_prog is not None:
+                    if g_prog is not None and g_status != "PLANNING":
                         bits.append(f"ep{int(have.get('progress') or 0)}->ep{g_prog}")
                     if g_status:
                         bits.append(f"{have.get('status') or '-'}->{g_status}")
@@ -276,7 +292,10 @@ def outbound_tick(
         _audit("  no AniList entry:", unmatched)
         log.info(
             "  %d updated, %d added, %d unmatched, %d unchanged",
-            len(updates), len(adds), len(unmatched), skipped,
+            len(updates),
+            len(adds),
+            len(unmatched),
+            skipped,
         )
     if newest:
         st.set("simkl_activity_all", newest)
@@ -328,7 +347,9 @@ def inbound_tick(cfg: Config, st: State, simkl: Simkl, anilist: AniList | None) 
     log.info("INBOUND from AniList/MAL")
     log.info(
         "  AniList: %d tracked, Simkl: %d known, %d to push",
-        len(entries), len(snap), len(changed),
+        len(entries),
+        len(snap),
+        len(changed),
     )
     pushes: list[str] = []
     no_mal: list[str] = []
@@ -377,7 +398,10 @@ def inbound_tick(cfg: Config, st: State, simkl: Simkl, anilist: AniList | None) 
         _audit("  pushing to Simkl:", pushes)
         _audit("  no MAL id:", no_mal)
         log.info(
-            "  %d pushed, %d unreachable, %d unchanged", len(pushes), len(no_mal), already
+            "  %d pushed, %d unreachable, %d unchanged",
+            len(pushes),
+            len(no_mal),
+            already,
         )
     # The snapshot is updated by OUTBOUND, so nothing to persist here beyond
     # what the writes themselves recorded.
@@ -508,9 +532,15 @@ def ratings_tick(
         settled.update({m: s for m, s in to_anilist})
         for mal_id, score in sorted(settled.items()):
             entry = anilist_by_mal.get(mal_id)
-            title = _al_title((entry or {}).get("media") or {}) if entry else f"mal:{mal_id}"
+            title = (
+                _al_title((entry or {}).get("media") or {})
+                if entry
+                else f"mal:{mal_id}"
+            )
             mal.update(mal_id, score_1dp=score)
-            to_mal_lines.append(f"{title} (rating -> {round(score)} on MAL, from {score})")
+            to_mal_lines.append(
+                f"{title} (rating -> {round(score)} on MAL, from {score})"
+            )
 
     unresolved = sum(1 for c in conflicts if c[3] == "skip")
     if to_al_lines or to_fl_lines or to_mal_lines:
@@ -558,6 +588,26 @@ def main() -> int:
         log.warning("DRY_RUN is on - every write is logged, none are sent")
 
     st = State(os.path.join(cfg.state_dir, "state.json"))
+
+    # Say out loud what was carried over. This is a sync service: the trackers
+    # are the truth and state is only a cache, so anything remembered here has
+    # to be visible when it turns out to be wrong.
+    snap = simkl_snapshot(st)
+    log.info(
+        "state: simkl snapshot %s (%d titles), cursor=%s",
+        "built " + str(st.get("simkl_snapshot_at"))
+        if st.get("simkl_snapshot_at")
+        else "ABSENT",
+        len(snap),
+        st.get("simkl_anime_cursor") or "-",
+    )
+    stale = [k for k in ("anilist_updated_at",) if st.get(k) is not None]
+    if stale:
+        for k in stale:
+            st.set(k, None)
+        st.save()
+        log.info("state: dropped keys from a previous design: %s", ", ".join(stale))
+
     simkl = Simkl(cfg.simkl_client_id, cfg.simkl_token, dry_run=cfg.dry_run)
     anilist = (
         AniList(cfg.anilist_token, dry_run=cfg.dry_run) if cfg.anilist_token else None

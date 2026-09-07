@@ -78,13 +78,15 @@ class Simkl:
     def add_history(self, payload: dict) -> Any:
         """POST /sync/history - payload shaped as {"anime":[{ids:{...}, ...}]}."""
         if self.dry_run:
-            log.info("[dry-run] simkl add_history %s", json.dumps(payload)[:400])
+            # The caller already logs one readable line per title. Dumping the
+            # episode array as well is what makes the container log unreadable.
+            log.debug("[dry-run] simkl add_history %s", json.dumps(payload)[:400])
             return {"dry_run": True}
         return self._req("POST", "/sync/history", body=payload)
 
     def add_rating(self, payload: dict) -> Any:
         if self.dry_run:
-            log.info("[dry-run] simkl add_rating %s", json.dumps(payload)[:400])
+            log.debug("[dry-run] simkl add_rating %s", json.dumps(payload)[:400])
             return {"dry_run": True}
         return self._req("POST", "/sync/ratings", body=payload)
 

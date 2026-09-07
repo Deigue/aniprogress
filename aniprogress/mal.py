@@ -77,7 +77,8 @@ class Mal:
         if not fields:
             return {}
         if self.dry_run:
-            log.info("[dry-run] mal update %s -> %s", mal_id, fields)
+            # Summarised one line per title by the caller's audit block.
+            log.debug("[dry-run] mal update %s -> %s", mal_id, fields)
             return {"dry_run": True}
 
         url = f"{BASE}/anime/{int(mal_id)}/my_list_status"

@@ -151,7 +151,8 @@ class AniList:
             # 7.8 -> 78 on the 0-100 raw scale; renders as 7.8 under POINT_10_DECIMAL
             variables["scoreRaw"] = int(round(float(score_1dp) * 10))
         if self.dry_run:
-            log.info("[dry-run] anilist save %s", variables)
+            # Summarised one line per title by the caller's audit block.
+            log.debug("[dry-run] anilist save %s", variables)
             return {"dry_run": True}
         return (self._gql(SAVE_MUTATION, variables) or {}).get("SaveMediaListEntry") or {}
 
