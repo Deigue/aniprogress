@@ -204,36 +204,32 @@ def outbound_tick(
     # would otherwise look unbuilt forever and re-read from the epoch each tick.
     have_snapshot = bool(st.get("simkl_snapshot_at"))
 
-    if have_snapshot and newest and newest == st.get("simkl_activity_all"):
-        log.info("OUTBOUND to AniList/MAL (no changes found)")
-        return
-
-    # Never call all_items without a date_from - Simkl's docs are explicit that
-    # it gets the client_id suspended. With no snapshot yet, read from the epoch
-    # so the picture starts complete; afterwards follow the cursor.
-    date_from = (
-        cfg.simkl_epoch
-        if not have_snapshot
-        else (st.get("simkl_anime_cursor") or cfg.simkl_epoch)
-    )
-    if not have_snapshot:
-        log.info("OUTBOUND building the first Simkl snapshot from %s", date_from)
-    blob = simkl.all_items("anime", date_from=date_from)
-    entries = Simkl.anime_entries(blob)
-    if not entries:
-        log.info("OUTBOUND to AniList/MAL (no changes found)")
+    # The activity timestamp decides whether to READ Simkl - never whether to
+    # reconcile. A change that happened before the cursor moved is still a real
+    # difference, and gating the whole tick on "did Simkl change since last
+    # minute" means such a title is never revisited. Pokemon Sun & Moon sat at
+    # Simkl 93 / AniList 92 indefinitely for exactly this reason.
+    if not have_snapshot or (newest and newest != st.get("simkl_activity_all")):
+        date_from = (
+            cfg.simkl_epoch
+            if not have_snapshot
+            else (st.get("simkl_anime_cursor") or cfg.simkl_epoch)
+        )
+        if not have_snapshot:
+            log.info("OUTBOUND building the first Simkl snapshot from %s", date_from)
+        entries = Simkl.anime_entries(simkl.all_items("anime", date_from=date_from))
+        update_simkl_snapshot(st, entries)
         st.set("simkl_snapshot_at", newest or date_from)
         if newest:
             st.set("simkl_activity_all", newest)
             st.set("simkl_anime_cursor", newest)
         st.save()
+
+    # Reconcile against the full picture of Simkl, not just what changed.
+    snap = simkl_snapshot(st)
+    if not snap:
+        log.info("OUTBOUND to AniList/MAL (no changes found)")
         return
-    log.info("OUTBOUND to AniList/MAL")
-    log.info("  Simkl: %d changed since %s", len(entries), date_from)
-    # Keep the shared picture of Simkl current from this same pull, so INBOUND
-    # never needs a read of its own.
-    update_simkl_snapshot(st, entries)
-    st.set("simkl_snapshot_at", newest or date_from)
 
     # One request: the current AniList state, so no write can regress it.
     current: dict[int, dict] = {}
@@ -243,13 +239,42 @@ def outbound_tick(
                 int((e.get("media") or {}).get("id") or 0): e
                 for e in anilist.list_entries()
             }
-            log.info("  AniList: %d tracked", len(current))
+            log.debug("anilist: %d tracked", len(current))
         except Exception:
             log.exception(
                 "could not load AniList state - skipping this tick rather "
                 "than risk overwriting it"
             )
             return
+
+    # Drive the reconciliation from the snapshot - the whole of Simkl as we last
+    # saw it - rather than from whatever the last incremental read returned. The
+    # snapshot rows are reshaped into the same form a Simkl entry has, so the
+    # guard logic below is unchanged.
+    by_mal = {
+        int((e.get("media") or {}).get("idMal")): e
+        for e in current.values()
+        if (e.get("media") or {}).get("idMal")
+    }
+    entries = []
+    for mal_key, srow in snap.items():
+        mal_int = _int_or_none(mal_key)
+        if mal_int is None:
+            continue
+        al_entry = by_mal.get(mal_int)
+        media = (al_entry or {}).get("media") or {}
+        entries.append({
+            "show": {
+                "title": _al_title(media) if media else f"mal:{mal_int}",
+                "ids": {
+                    "mal": str(mal_int),
+                    "anilist": str(media["id"]) if media.get("id") else None,
+                },
+            },
+            "status": srow.get("status"),
+            "watched_episodes_count": int(srow.get("progress") or 0),
+            "user_rating": srow.get("rating"),
+        })
 
     skipped = 0
     updates: list[str] = []
@@ -276,10 +301,13 @@ def outbound_tick(
 
         key = str(mal_id or anilist_id)
         if anilist and cfg.enable_anilist and st.differs("anilist", key, signature):
+            # No by_mal() lookup here. Reconciliation walks the whole Simkl
+            # snapshot, so resolving every unmatched title would cost one AniList
+            # request each and 404 on anything AniList does not carry. More to
+            # the point: a title absent from your AniList list should not be
+            # created from Simkl's word - that is the same "absence is not
+            # evidence" mistake, pointed the other way.
             target = anilist_id
-            if target is None:  # rare: Simkl knew no AniList id
-                media = anilist.by_mal(mal_id)
-                target = media["id"] if media else None
             if target is None:
                 unmatched.append(f"{_title_of(e)}  (mal:{mal_id})")
             else:
@@ -316,8 +344,10 @@ def outbound_tick(
             mal_writes.append(f"{_title_of(e)} (ep{progress} {status}{note})")
 
     if not (updates or adds or mal_writes or unmatched):
-        log.info("  nothing to write - %d already equal or better", skipped)
+        log.info("OUTBOUND to AniList/MAL (no changes found)")
     else:
+        log.info("OUTBOUND to AniList/MAL")
+        log.info("  Simkl: %d known, AniList: %d tracked", len(snap), len(current))
         _audit("  updating:", updates)
         _audit("  adding:", adds)
         _audit("  mirrored to MAL:", mal_writes)
@@ -329,9 +359,6 @@ def outbound_tick(
             len(unmatched),
             skipped,
         )
-    if newest:
-        st.set("simkl_activity_all", newest)
-        st.set("simkl_anime_cursor", newest)
     st.save()
 
 
