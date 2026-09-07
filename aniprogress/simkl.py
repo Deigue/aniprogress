@@ -84,6 +84,17 @@ class Simkl:
             return {"dry_run": True}
         return self._req("POST", "/sync/history", body=payload)
 
+    def remove_history(self, payload: dict) -> Any:
+        """POST /sync/history/remove - same payload shape as add_history.
+
+        A bare {"ids": {...}} with no episodes removes the whole show, which is
+        the mirror image of the bug this exists to undo.
+        """
+        if self.dry_run:
+            log.debug("[dry-run] simkl remove_history %s", json.dumps(payload)[:400])
+            return {"dry_run": True}
+        return self._req("POST", "/sync/history/remove", body=payload)
+
     def add_rating(self, payload: dict) -> Any:
         if self.dry_run:
             log.debug("[dry-run] simkl add_rating %s", json.dumps(payload)[:400])

@@ -251,11 +251,33 @@ def test_simkl_never_scores_anilist() -> None:
     check("progress still flowed", [s["progress"] for s in al.saves], [12])
 
 
+def test_incident_guards() -> None:
+    """The two rules that would have prevented the 2026-09-07 data loss."""
+    print("\n" + "=" * 70)
+    print("INCIDENT - a plan-to-watch title must never be marked watched")
+    print("=" * 70)
+    from aniprogress.main import guard
+
+    # 1. Simkl saying COMPLETED, with no progress, must not move AniList off
+    #    PLANNING. Simkl's completion is partly derived from what we wrote.
+    have = {"status": "PLANNING", "progress": 0}
+    check("COMPLETED with no progress cannot promote PLANNING",
+          guard(have, "COMPLETED", 0), None)
+
+    # 2. A real watch still gets through, because progress carries the status.
+    decision = guard(have, "COMPLETED", 12)
+    check("a genuine watch still promotes", decision, ("COMPLETED", 12, "improve"))
+
+    # 3. Progress never goes backwards.
+    check("progress cannot regress",
+          guard({"status": "CURRENT", "progress": 93}, "CURRENT", 92), None)
+
+
 def main() -> int:
     for fn in (test_plan_skip_is_default, test_plan_floppy_wins, test_plan_anilist_wins,
                test_tick_and_idempotence,
                test_decimals_survive, test_unrated_is_not_zero,
-               test_simkl_never_scores_anilist):
+               test_simkl_never_scores_anilist, test_incident_guards):
         fn()
     print("\n" + "=" * 70)
     if FAILURES:

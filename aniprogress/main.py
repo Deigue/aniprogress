@@ -30,6 +30,11 @@ from .state import State
 log = logging.getLogger("aniprogress")
 _stop = threading.Event()
 
+# Only one tick runs at a time. Besides keeping each tick's log block together,
+# it stops OUTBOUND and INBOUND from acting on each other's half-applied writes
+# - which is the shape the 2026-09-07 incident took.
+_tick_lock = threading.Lock()
+
 
 def _score_1dp(raw) -> float | None:
     """Simkl ratings are integers; treat them as N.0 so comparisons are stable."""
@@ -74,8 +79,20 @@ def guard(have: dict | None, status, progress):
 
     # progress: only ever move forward
     out_prog = progress if progress > cur_prog else None
-    # status: only ever move up the ladder
+
+    # status: only ever move up the ladder, and never off PLANNING on Simkl's
+    # word alone. Simkl's completion state is partly derived from history this
+    # service writes, so treating it as authoritative is a feedback loop: one
+    # bad push marked a plan-to-watch show completed on Simkl, and this rule
+    # then copied that onto AniList. A real watch arrives as progress, which is
+    # handled above and drags the status with it.
     out_status = status if _RANK.get(status, 0) > _RANK.get(cur_status, 0) else None
+    if out_status and cur_status == "PLANNING" and out_prog is None:
+        log.debug(
+            "refusing PLANNING -> %s with no progress: Simkl's status alone "
+            "is not evidence of a watch", status,
+        )
+        out_status = None
 
     if out_prog is None and out_status is None:
         return None
@@ -326,20 +343,36 @@ def inbound_tick(cfg: Config, st: State, simkl: Simkl, anilist: AniList | None) 
         return
 
     changed = []
+    unknown = 0
     for e in entries:
         id_mal = (e.get("media") or {}).get("idMal")
         if not id_mal:
             continue
+        progress = int(e.get("progress") or 0)
+
+        # Nothing watched means nothing to push. This is the incident guard:
+        # add_history with a bare {"ids": {...}} and no episodes tells Simkl to
+        # mark the WHOLE show watched, which is how a shelf of plan-to-watch
+        # titles became COMPLETED and then propagated back onto AniList.
+        if progress <= 0:
+            continue
+
         have = snap.get(str(int(id_mal)))
         if have is None:
-            changed.append(e)  # Simkl has never seen it
+            # Absent from Simkl is not evidence that it was watched. Adding it
+            # here is what let one bad inference reach two services at once.
+            unknown += 1
             continue
+
         raw = e.get("scoreRaw")
         score = round(int(raw) / 10.0, 1) if raw else None
-        if int(e.get("progress") or 0) > int(have.get("progress") or 0):
+        if progress > int(have.get("progress") or 0):
             changed.append(e)
         elif score is not None and have.get("rating") is None:
             changed.append(e)
+
+    if unknown:
+        log.info("  %d AniList title(s) Simkl has never seen - not pushed", unknown)
 
     if not changed:
         log.info("INBOUND from AniList/MAL (no changes found)")
@@ -559,7 +592,13 @@ def _loop(name: str, fn, interval: int) -> None:
     while not _stop.is_set():
         started = time.monotonic()
         try:
-            fn()
+            # One tick at a time, so a tick's multi-line block stays contiguous.
+            # Python serialises individual log records but not groups of them, so
+            # three threads on overlapping intervals spliced their output: an
+            # INBOUND header printed above OUTBOUND's body, which made a real
+            # incident far harder to read than it needed to be.
+            with _tick_lock:
+                fn()
         except Exception:
             log.exception("%s tick failed", name)
         _stop.wait(max(5.0, interval - (time.monotonic() - started)))

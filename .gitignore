@@ -6,3 +6,4 @@ aniprogress-data/
 __pycache__/
 *.pyc
 .venv/
+snapshots/
