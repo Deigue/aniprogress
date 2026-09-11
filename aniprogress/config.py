@@ -65,10 +65,9 @@ class Config:
     ratings_winner: str = field(
         default_factory=lambda: os.environ.get("RATINGS_WINNER", "skip").strip().lower())
 
-    # --- cadence -------------------------------------------------------------
-    poll_out_seconds: int = field(default_factory=lambda: _i("POLL_OUT_SECONDS", 60))
-    poll_in_seconds: int = field(default_factory=lambda: _i("POLL_IN_SECONDS", 600))
-    poll_ratings_seconds: int = field(default_factory=lambda: _i("POLL_RATINGS_SECONDS", 900))
+    # --- cadence -----------------------------------------------------------
+    reconcile_seconds: int = field(default_factory=lambda: _i("RECONCILE_SECONDS", 60))
+    ratings_seconds: int = field(default_factory=lambda: _i("RATINGS_SECONDS", 900))
 
     # The date_from used the very first time, before a cursor exists. Simkl
     # filters on last-modified, not watch date, so any item in the account was
@@ -107,5 +106,5 @@ class Config:
                 f"simkl_push={on(self.enable_simkl_push)} "
                 f"floppy_ratings={on(self.enable_floppy_ratings)}"
                 f"{f'(conflicts: {self.ratings_winner})' if self.enable_floppy_ratings else ''} "
-                f"dry_run={on(self.dry_run)} out={self.poll_out_seconds}s "
-                f"in={self.poll_in_seconds}s ratings={self.poll_ratings_seconds}s")
+                f"dry_run={on(self.dry_run)} "
+                f"reconcile={self.reconcile_seconds}s ratings={self.ratings_seconds}s")

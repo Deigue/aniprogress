@@ -89,7 +89,10 @@ class AniList:
                                 e.code, attempt + 1)
                     time.sleep(3 * (attempt + 1))
                     continue
-                log.error("anilist HTTP %s: %s", e.code, e.read()[:300])
+                # 404 is a valid "no such Media" answer (by_mal lookups); the
+                # caller handles it, so do not shout about it.
+                lvl = log.debug if e.code == 404 else log.error
+                lvl("anilist HTTP %s: %s", e.code, e.read()[:300])
                 raise
             except (URLError, TimeoutError) as e:
                 log.warning("anilist transport error (%s), retry %d", e, attempt + 1)
@@ -131,12 +134,18 @@ class AniList:
         return list(seen.values())
 
     def by_mal(self, id_mal: int) -> dict | None:
-        """MAL id -> AniList media."""
+        """MAL id -> AniList media, or None. AniList 404s when it has no such
+        anime; that is a real answer here, not an error - swallow it."""
         if id_mal in self._mal_cache:
             return self._mal_cache[id_mal]
-        media = (self._gql(BY_MAL_QUERY, {"idMal": int(id_mal)}) or {}).get("Media")
-        if media:
-            self._mal_cache[id_mal] = media
+        try:
+            media = (self._gql(BY_MAL_QUERY, {"idMal": int(id_mal)}) or {}).get("Media")
+        except HTTPError as e:
+            if e.code == 404:
+                media = None
+            else:
+                raise
+        self._mal_cache[id_mal] = media  # cache misses too, so we ask once
         return media
 
     # --- writes --------------------------------------------------------------

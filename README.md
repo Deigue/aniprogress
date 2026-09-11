@@ -5,28 +5,43 @@ Keeps anime **progress, watchlist status and ratings** in sync between **Simkl**
 
 ## What it does
 
-**Progress and watchlist**
+One **reconcile** pass syncs Simkl and AniList in both directions. It reads each side once
+and compares the **two live libraries** — there is no stored record of "what we wrote"
+(that cache drifted from reality and caused every past incident). The comparison itself
+is the dedup: once a write lands the sides agree and the next pass is a no-op.
 
-- **Outbound to AniList / MAL** — your player scrobbles to Simkl; AniList and MAL follow.
-  Progress and status only.
-- **Inbound to Simkl** — for players that write straight to AniList.
+- **Progress** is monotonic. Episodes watched do not un-happen, so the higher side wins
+  and the lower side is pulled up — with an *explicit episode list*, never a bare id
+  (which Simkl reads as "mark the whole show watched").
+- **Watchlist status** moves both ways. A status that rides in with a progress advance is
+  trusted. For a bare status disagreement at equal progress, Simkl's incremental feed
+  says which side just changed it — that side wins. (A rare true simultaneous edit
+  resolves toward Simkl and can be redone.)
+- **`COMPLETED` is a floor.** A plan-to-watch or half-watched row on Simkl over a
+  completed AniList entry is a deliberate "I'll rewatch this" marker — AniList is left
+  alone. A real completion still arrives as progress.
+- A title present on one side and missing on the other is **created** on the other, at
+  whatever state it holds.
 
-It does not write progress into Floppy. Floppy has its own scheduled Simkl import, and a second
-writer would just race it for the same rows.
+It does not write progress into Floppy. Floppy has its own scheduled Simkl import.
 
 **Ratings**
 
-| Direction        | Behaviour                                       |
-| ---------------- | ----------------------------------------------- |
-| Inbound to Simkl | moves ratings, **rounded** to a whole number    |
-| Outbound to AniList | **no ratings pushed** — Simkl cannot hold a decimal |
-| Floppy ↔ AniList | syncs ratings **both ways, decimals preserved** |
+A rating only ever crosses into a side that has **none** for that title — an existing
+score is never overwritten.
 
-Between Floppy and AniList, a missing rating is filled in from whichever side has one. If the two
-sides hold *different* ratings, that is a person having entered two numbers — so by default neither
-is overwritten and the clash is logged. Set `RATINGS_WINNER` if you would rather one side always win.
+- **Simkl ↔ AniList**: the reconcile fills whichever side is empty. Simkl stores whole
+  numbers, so a rating sent there is rounded; AniList keeps the decimal.
+- **Floppy ↔ AniList**: a separate ratings pass, decimals preserved both ways. When the
+  two hold *different* numbers it checks the previous cycle — if exactly one side moved,
+  that is the newer edit and it wins; if both moved or neither, it logs a `DECIDE` line
+  and writes nothing. Set `RATINGS_WINNER=anilist` to make AniList's decimal
+  authoritative instead.
 
-Every direction is a no-op when nothing has changed, so it is cheap to run continuously.
+Simkl already feeds Floppy on its own schedule, so a Simkl-only rating reaches Floppy
+that way — the service never writes it there directly.
+
+Both passes are a no-op when nothing has changed, so they are cheap to run continuously.
 
 ## Quick start
 
@@ -45,9 +60,6 @@ services:
       ENABLE_ANILIST: "true"
       ENABLE_SIMKL_PUSH: "true"
       ENABLE_MAL: "false"
-
-      POLL_OUT_SECONDS: "60"
-      POLL_IN_SECONDS: "600"
 
       # Leave this on until you have read a cycle of logs.
       DRY_RUN: "true"
@@ -88,45 +100,40 @@ Read the log for a full cycle, then set `DRY_RUN` to `false` and restart.
 
 ### Cadence
 
-| Variable               | Default | What it does                                                                |
-| ---------------------- | ------- | --------------------------------------------------------------------------- |
-| `POLL_OUT_SECONDS`     | `60`    | How often to check Simkl for new activity. The busy direction.              |
-| `POLL_IN_SECONDS`      | `600`   | How often to check AniList. Raise it if nothing writes to AniList directly. |
-| `POLL_RATINGS_SECONDS` | `900`   | How often to reconcile Floppy and AniList ratings.                          |
+| Variable             | Default | What it does                                              |
+| -------------------- | ------- | -------------------------------------------------------- |
+| `RECONCILE_SECONDS`  | `60`    | How often the Simkl ↔ AniList reconcile runs.            |
+| `RATINGS_SECONDS`    | `900`   | How often the Floppy ↔ AniList ratings pass runs.        |
 
 ### Other
 
-| Variable    | Default           | What it does                                                               |
-| ----------- | ----------------- | -------------------------------------------------------------------------- |
-| `STATE_DIR` | `/data`           | Where `state.json` lives. Mount it, or every restart re-checks everything. |
-| `LOG_LEVEL` | `INFO`            | `DEBUG` to see every decision.                                             |
-| `TZ`        | container default | Set it. Timestamps in logs are otherwise UTC.                              |
+| Variable      | Default           | What it does                                                    |
+| ------------- | ----------------- | ------------------------------------------------------------- |
+| `STATE_DIR`   | `/data`           | Where `state.json` lives — mount it, or every restart rebuilds the Simkl snapshot from scratch. |
+| `SIMKL_EPOCH` | `2010-01-01T00:00:00Z` | `date_from` for the first Simkl read. Raise it to ignore history older than a given date. |
+| `LOG_LEVEL`   | `INFO`            | `DEBUG` to see every decision.                                  |
+| `TZ`          | container default | Set it. Timestamps in logs are otherwise UTC.                   |
 
 ## Before you start
 
 **Set your AniList score format to `POINT_10_DECIMAL`** (AniList → Settings → Lists). Without it,
 decimal ratings render wrong. The service logs a warning at startup if it is set to anything else.
 
-**Mount `/data`.** State lives in `state.json` and is what makes repeated runs free.
+**Mount `/data`.** The Simkl snapshot lives in `state.json`; without it every restart
+rebuilds it with one full Simkl read.
 
 ## Checking it without touching the network
 
-`replay_test.py` replays a Simkl export through the sync logic with every API client stubbed —
-no tokens, no requests. It reports what *would* be written and verifies that a second pass writes
-nothing.
+All three stub every API client — no tokens, no requests:
 
-```
-python replay_test.py path/to/simkl-export.json
-```
+- `watchlist_test.py` — the reconcile core: progress, status arbitration, the `COMPLETED`
+  floor, one-sided titles.
+- `ratings_test.py` — the Floppy ↔ AniList ratings pass and the Simkl rating gap-fill.
+- `replay_test.py path/to/simkl-export.json` — replays a real Simkl export through the
+  reconcile and verifies a second pass writes nothing.
 
-`ratings_test.py` does the same for the Floppy ↔ AniList ratings pair — a built-in library,
-no file needed:
-
-```
-python ratings_test.py
-```
-
-`preflight.py` checks your credentials and settings before the first real run.
+`preflight.py` checks your credentials and settings against the live APIs before the
+first real run.
 
 ## License
 

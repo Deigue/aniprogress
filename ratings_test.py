@@ -192,92 +192,108 @@ def test_unrated_is_not_zero() -> None:
     check("unrated on both sides writes nothing", (to_al, to_fl), ([], []))
 
 
-def test_simkl_never_scores_anilist() -> None:
-    """The rule that protects every decimal on AniList.
+def test_reconcile_ratings_gapfill() -> None:
+    """reconcile_one moves a rating only into an empty slot, never over one."""
+    print("\n" + "=" * 70 + "\nRECONCILE - rating gap-fill both ways, no overwrite\n" + "=" * 70)
+    from aniprogress.main import reconcile_one
 
-    Regression test for a real bug: the outbound tick used to hand Simkl's
-    rounded score to AniList, and the guard allowed the write whenever the two
-    differed by 1.0 or more. Against the live library that would have turned
-    Kokoro Connect 5.5 into 9.0 and Mushoku Tensei 8.7 into 6.0, with 121
-    decimal scores exposed.
-    """
-    print("\n" + "=" * 70 + "\nOUTBOUND - Simkl must never write a score to AniList\n" + "=" * 70)
-    from aniprogress.main import outbound_tick
-    from aniprogress.simkl import Simkl
+    # AniList rated, Simkl empty -> rounded to Simkl
+    al = {"status": "COMPLETED", "progress": 12, "score": 8.4}
+    sk = {"status": "completed", "progress": 12, "rating": None}
+    check("AniList decimal -> Simkl rounded",
+          reconcile_one(al, sk, moved=False, push_simkl=True), [("sk_rate", 8)])
 
-    class StubSimkl:
-        def activities(self):
-            return {"all": "2026-01-01T00:00:00Z"}
+    # Simkl rated, AniList empty -> fills AniList (as 1dp of the int)
+    al = {"status": "COMPLETED", "progress": 12, "score": None}
+    sk = {"status": "completed", "progress": 12, "rating": 9}
+    check("Simkl int -> empty AniList slot",
+          reconcile_one(al, sk, moved=False, push_simkl=True),
+          [("al", None, None, 9.0)])
 
-        def all_items(self, media_type="anime", status=None, date_from=None, extended="full"):
-            return {"anime": [{
-                "status": "completed",
-                "watched_episodes_count": 12,
-                "user_rating": 9,                      # Simkl's rounded score
-                "show": {"title": "Decimal Holder",
-                         "ids": {"mal": "601", "anilist": "6001"}},
-            }]}
-
-        anime_entries = staticmethod(Simkl.anime_entries)
-        ids_of = staticmethod(Simkl.ids_of)
-
-    class SpyAniList:
-        def __init__(self):
-            self.saves = []
-
-        def list_entries(self):
-            # AniList already holds a hand-set decimal well over 1.0 away
-            return [al_entry(6001, 601, 5.5, "Decimal Holder")]
-
-        def by_mal(self, id_mal):
-            return {"id": 6001}
-
-        def save(self, media_id, status=None, progress=None, score_1dp=None):
-            self.saves.append({"mediaId": media_id, "status": status,
-                               "progress": progress, "score_1dp": score_1dp})
-            return {}
-
-    cfg = Config()
-    cfg.enable_anilist = True
-    cfg.enable_mal = False
-    cfg.dry_run = False
-    st = State(os.path.join(tempfile.mkdtemp(), "state.json"))
-    al = SpyAniList()
-    outbound_tick(cfg, st, StubSimkl(), al, None)
-
-    scores = [s["score_1dp"] for s in al.saves]
-    check("no save carried a score", scores, [None] * len(scores) if scores else [])
-    check("a score was never sent at all", any(s is not None for s in scores), False)
-    check("progress still flowed", [s["progress"] for s in al.saves], [12])
+    # Both hold a score -> never touched (AniList keeps its decimal)
+    al = {"status": "COMPLETED", "progress": 12, "score": 5.5}
+    sk = {"status": "completed", "progress": 12, "rating": 9}
+    check("both rated -> nothing", reconcile_one(al, sk, moved=False, push_simkl=True), [])
 
 
-def test_incident_guards() -> None:
-    """The two rules that would have prevented the 2026-09-07 data loss."""
-    print("\n" + "=" * 70)
-    print("INCIDENT - a plan-to-watch title must never be marked watched")
-    print("=" * 70)
-    from aniprogress.main import guard
+def test_reconcile_progress_and_status() -> None:
+    print("\n" + "=" * 70 + "\nRECONCILE - progress monotonic, status by who moved\n" + "=" * 70)
+    from aniprogress.main import reconcile_one
 
-    # 1. Simkl saying COMPLETED, with no progress, must not move AniList off
-    #    PLANNING. Simkl's completion is partly derived from what we wrote.
-    have = {"status": "PLANNING", "progress": 0}
-    check("COMPLETED with no progress cannot promote PLANNING",
-          guard(have, "COMPLETED", 0), None)
+    # AniList ahead on progress -> explicit episode list to Simkl
+    al = {"status": "CURRENT", "progress": 5, "score": None}
+    sk = {"status": "watching", "progress": 2, "rating": None}
+    check("AniList ep5 > Simkl ep2 -> sk_hist 5",
+          reconcile_one(al, sk, moved=False, push_simkl=True), [("sk_hist", 5)])
 
-    # 2. A real watch still gets through, because progress carries the status.
-    decision = guard(have, "COMPLETED", 12)
-    check("a genuine watch still promotes", decision, ("COMPLETED", 12, "improve"))
+    # Simkl ahead on progress -> AniList gets progress + derived status
+    al = {"status": "CURRENT", "progress": 2, "score": None}
+    sk = {"status": "completed", "progress": 12, "rating": None}
+    check("Simkl ep12 > AniList ep2 -> al COMPLETED/12",
+          reconcile_one(al, sk, moved=False, push_simkl=True),
+          [("al", "COMPLETED", 12, None)])
 
-    # 3. Progress never goes backwards.
-    check("progress cannot regress",
-          guard({"status": "CURRENT", "progress": 93}, "CURRENT", 92), None)
+    # Equal progress, status differs, Simkl moved -> Simkl wins onto AniList
+    al = {"status": "CURRENT", "progress": 5, "score": None}
+    sk = {"status": "dropped", "progress": 5, "rating": None}
+    check("dropped on Simkl (moved) -> AniList DROPPED",
+          reconcile_one(al, sk, moved=True, push_simkl=True),
+          [("al", "DROPPED", None, None)])
+
+    # Equal progress, status differs, Simkl did NOT move -> AniList wins onto Simkl
+    check("paused on AniList (Simkl still) -> Simkl hold",
+          reconcile_one({"status": "PAUSED", "progress": 5, "score": None},
+                        {"status": "watching", "progress": 5, "rating": None},
+                        moved=False, push_simkl=True),
+          [("sk_list", "hold")])
+
+
+def test_reconcile_completed_floor() -> None:
+    print("\n" + "=" * 70 + "\nRECONCILE - COMPLETED on AniList is a hard floor\n" + "=" * 70)
+    from aniprogress.main import reconcile_one
+
+    # Simkl plan-to-watch over a completed AniList entry (rewatch marker) -> nothing
+    check("Simkl plantowatch does not un-complete AniList",
+          reconcile_one({"status": "COMPLETED", "progress": 37, "score": None},
+                        {"status": "plantowatch", "progress": 37, "rating": None},
+                        moved=True, push_simkl=True),
+          [])
+    # ...even when Simkl shows a lower episode count
+    check("Simkl watching/ep1 does not un-complete AniList",
+          reconcile_one({"status": "COMPLETED", "progress": 12, "score": None},
+                        {"status": "watching", "progress": 1, "rating": None},
+                        moved=True, push_simkl=True),
+          [])
+
+
+def test_reconcile_one_sided() -> None:
+    print("\n" + "=" * 70 + "\nRECONCILE - a title on one side only is mirrored\n" + "=" * 70)
+    from aniprogress.main import reconcile_one
+
+    # On AniList only, watched -> pushed to Simkl as explicit history
+    check("AniList-only completed -> sk_hist",
+          reconcile_one({"status": "COMPLETED", "progress": 12, "score": 8.0}, None,
+                        moved=False, push_simkl=True),
+          [("sk_hist", 12), ("sk_rate", 8)])
+    # On AniList only, plan-to-watch -> add_to_list
+    check("AniList-only planning -> sk_list plantowatch",
+          reconcile_one({"status": "PLANNING", "progress": 0, "score": None}, None,
+                        moved=False, push_simkl=True),
+          [("sk_list", "plantowatch")])
+    # On Simkl only -> create on AniList mirroring it
+    check("Simkl-only completed -> al_new",
+          reconcile_one(None, {"status": "completed", "progress": 12, "rating": 7},
+                        moved=False, push_simkl=True),
+          [("al_new", "COMPLETED", 12, 7.0)])
+
 
 
 def main() -> int:
     for fn in (test_plan_skip_is_default, test_plan_floppy_wins, test_plan_anilist_wins,
                test_tick_and_idempotence,
                test_decimals_survive, test_unrated_is_not_zero,
-               test_simkl_never_scores_anilist, test_incident_guards):
+               test_reconcile_ratings_gapfill, test_reconcile_progress_and_status,
+               test_reconcile_completed_floor, test_reconcile_one_sided):
         fn()
     print("\n" + "=" * 70)
     if FAILURES:

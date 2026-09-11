@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Offline proof: replay a real Simkl export through the outbound logic.
+"""Offline proof: replay a real Simkl export through the reconcile logic.
 
-No network, no tokens. Stubs the Simkl/AniList/MAL clients and feeds the anime
-block of a Simkl backup through outbound_tick, so you can see exactly which
-writes would fire and confirm the dedup gate holds.
+No network, no tokens. Stubs Simkl/AniList/MAL and feeds the anime block of a
+Simkl backup through reconcile_tick, so you can see which writes would fire and
+confirm that once both sides agree a second pass does nothing.
 
     python replay_test.py path/to/simkl-export.json
 
@@ -13,14 +13,15 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 import tempfile
-import os
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from aniprogress.config import Config          # noqa: E402
-from aniprogress.main import outbound_tick     # noqa: E402
-from aniprogress.state import State            # noqa: E402
+from aniprogress.config import Config           # noqa: E402
+from aniprogress.main import reconcile_tick     # noqa: E402
+from aniprogress.simkl import Simkl             # noqa: E402
+from aniprogress.state import State             # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)-7s %(message)s")
 
@@ -28,38 +29,48 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)-7s %(message)s")
 class FakeSimkl:
     def __init__(self, anime):
         self._anime = anime
-        self.calls = []
+        self.history, self.lists, self.ratings = [], [], []
 
     def activities(self):
-        self.calls.append("activities")
         return {"all": "2026-09-03T22:17:00Z"}
 
     def all_items(self, media_type="anime", status=None, date_from=None, extended="full"):
-        self.calls.append(f"all_items(date_from={date_from})")
         return {"anime": self._anime}
 
-    @staticmethod
-    def anime_entries(blob):
-        from aniprogress.simkl import Simkl
-        return Simkl.anime_entries(blob)
-
-    @staticmethod
-    def ids_of(entry):
-        from aniprogress.simkl import Simkl
-        return Simkl.ids_of(entry)
+    def add_history(self, p): self.history.append(p); return {}
+    def add_to_list(self, p): self.lists.append(p); return {}
+    def add_rating(self, p): self.ratings.append(p); return {}
+    anime_entries = staticmethod(Simkl.anime_entries)
+    ids_of = staticmethod(Simkl.ids_of)
 
 
 class FakeAniList:
+    """Starts empty, then remembers what reconcile creates so pass 2 can see a
+    converged library."""
     def __init__(self):
-        self.writes = []
-        self.lookups = 0
+        self.saves = []
+        self._by_id: dict[int, dict] = {}
+
+    def list_entries(self):
+        return list(self._by_id.values())
 
     def by_mal(self, id_mal):
-        self.lookups += 1
-        return None
+        # Pretend every MAL id resolves to a distinct AniList media id.
+        return {"id": 900_000 + int(id_mal), "idMal": int(id_mal),
+                "episodes": None, "title": {"romaji": f"mal{id_mal}"}}
 
     def save(self, media_id, status=None, progress=None, score_1dp=None):
-        self.writes.append((media_id, status, progress, score_1dp))
+        self.saves.append((media_id, status, progress, score_1dp))
+        e = self._by_id.setdefault(int(media_id), {
+            "id": int(media_id) * 7, "media": {"id": int(media_id),
+            "idMal": int(media_id) - 900_000, "episodes": None,
+            "title": {"romaji": f"m{media_id}"}}})
+        if status is not None:
+            e["status"] = status
+        if progress is not None:
+            e["progress"] = progress
+        if score_1dp is not None:
+            e["scoreRaw"] = int(round(score_1dp * 10))
         return {}
 
 
@@ -76,66 +87,36 @@ def main():
     if len(sys.argv) < 2:
         print(__doc__)
         return 1
-    path = sys.argv[1]
-    anime = json.load(open(path, encoding="utf-8")).get("anime") or []
-    print(f"loaded {len(anime)} anime entries from {path}\n")
+    anime = json.load(open(sys.argv[1], encoding="utf-8")).get("anime") or []
+    print(f"loaded {len(anime)} anime entries from {sys.argv[1]}\n")
 
     cfg = Config()
-    cfg.enable_anilist = cfg.enable_mal = True
-    cfg.dry_run = True
+    cfg.enable_anilist = cfg.enable_simkl_push = True
+    cfg.enable_mal = False
+    cfg.dry_run = False   # fakes only record; state has no write-cache to spoil
 
     st = State(os.path.join(tempfile.mkdtemp(), "state.json"))
-    simkl, al, mal = FakeSimkl(anime), FakeAniList(), FakeMal()
+    simkl, al = FakeSimkl(anime), FakeAniList()
 
-    print("=" * 70, "\nPASS 1 - cold state, everything should be written\n", "=" * 70)
-    logging.disable(logging.INFO)
-    outbound_tick(cfg, st, simkl, al, mal)
-    logging.disable(logging.NOTSET)
-    print(f"  anilist writes : {len(al.writes)}")
-    print(f"  mal writes     : {len(mal.writes)}")
-    print(f"  by_mal lookups : {al.lookups}   <- should be ~1 (Simkl supplies anilist ids)")
-    print(f"  simkl calls    : {simkl.calls}")
+    print("=" * 70, "\nPASS 1 - cold AniList, Simkl library replayed in\n", "=" * 70)
+    reconcile_tick(cfg, st, simkl, al, None)
+    p1 = (len(al.saves), len(simkl.history), len(simkl.lists), len(simkl.ratings))
+    print(f"  AniList saves      : {p1[0]}")
+    print(f"  Simkl history/list/rating writes : {p1[1]}/{p1[2]}/{p1[3]}")
 
-    n1_al, n1_mal = len(al.writes), len(mal.writes)
+    print("\n" + "=" * 70, "\nPASS 2 - libraries now agree, must be a no-op\n", "=" * 70)
+    reconcile_tick(cfg, st, simkl, al, None)
+    p2 = (len(al.saves) - p1[0], len(simkl.history) - p1[1],
+          len(simkl.lists) - p1[2], len(simkl.ratings) - p1[3])
+    print(f"  new AniList saves  : {p2[0]}   <- want 0")
+    print(f"  new Simkl writes   : {p2[1]}/{p2[2]}/{p2[3]}   <- want 0/0/0")
 
-    print("\n" + "=" * 70, "\nPASS 2 - nothing changed, must be a total no-op\n", "=" * 70)
-    outbound_tick(cfg, st, simkl, al, mal)
-    print(f"  anilist writes : {len(al.writes) - n1_al}   <- must be 0")
-    print(f"  mal writes     : {len(mal.writes) - n1_mal}   <- must be 0")
-    ok_noop = len(al.writes) == n1_al and len(mal.writes) == n1_mal
-
-    print("\n" + "=" * 70, "\nSPOT CHECK - longest series in the export\n", "=" * 70)
-    # The longest-running entry is the one most likely to span several cours,
-    # which is where progress and id mapping are worth eyeballing by hand.
-    def _total_eps(entry):
-        try:
-            return int(entry.get("total_episodes_count") or 0)
-        except (TypeError, ValueError):
-            return 0
-
-    with_ids = [e for e in anime if ((e.get("show") or {}).get("ids") or {}).get("anilist")]
-    if not with_ids:
-        print("  no entries carry an AniList id - nothing to spot check")
-    else:
-        e = max(with_ids, key=_total_eps)
-        ids = e["show"]["ids"]
-        w = next((x for x in al.writes if x[0] == int(ids["anilist"])), None)
-        print(f"  title    : {e['show'].get('title')}")
-        print(f"  ids      : mal={ids.get('mal')} anilist={ids.get('anilist')} kitsu={ids.get('kitsu')}")
-        print(f"  simkl    : status={e.get('status')} watched={e.get('watched_episodes_count')}"
-              f"/{e.get('total_episodes_count')} last={e.get('last_watched')}")
-        print(f"  -> anilist write: mediaId={w[0]} status={w[1]} progress={w[2]} score={w[3]}"
-              if w else "  -> NO WRITE")
-
-    print("\n" + "=" * 70, "\nRATING FIDELITY - scoreRaw round-trip\n", "=" * 70)
-    rated = [w for w in al.writes if w[3] is not None][:6]
-    for media_id, status, prog, score in rated:
-        print(f"  score {score}  ->  scoreRaw {int(round(score * 10))}  ->  renders {score}")
-
+    ok = p2 == (0, 0, 0, 0)
     print("\n" + "=" * 70)
-    print("RESULT:", "PASS - dedup holds, no redundant writes" if ok_noop
-          else "FAIL - second pass wrote again")
+    print("RESULT:", "PASS - converges, second pass is silent" if ok
+          else "FAIL - second pass still wrote")
     print("=" * 70)
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
