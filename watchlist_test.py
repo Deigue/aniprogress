@@ -54,18 +54,26 @@ def sk_row(mal, status, watched=0, rating=None):
 
 
 class StubSimkl:
-    def __init__(self, rows, moved_since=None):
+    def __init__(self, rows, moved_since=None, removed_at="2026-01-01T00:00:00Z",
+                 catalogue=None):
         self._rows = rows
         self._moved = moved_since if moved_since is not None else rows
-        self.history, self.lists, self.ratings = [], [], []
+        self._removed_at = removed_at
+        self._catalogue = catalogue          # None -> everything exists
+        self.history, self.lists, self.ratings, self.lookups = [], [], [], []
 
     def activities(self):
-        return {"all": "2026-03-01T00:00:00Z"}
+        return {"all": "2026-03-01T00:00:00Z",
+                "anime": {"removed_from_list": self._removed_at}}
 
     def all_items(self, media_type="anime", status=None, date_from=None, extended="full"):
-        # date_from == epoch -> full build; otherwise -> "what moved"
+        # date_from == epoch -> full read; otherwise -> "what moved"
         full = str(date_from).startswith("2010")
         return {"anime": list(self._rows if full else self._moved)}
+
+    def in_catalogue(self, mal_id):
+        self.lookups.append(int(mal_id))
+        return True if self._catalogue is None else int(mal_id) in self._catalogue
 
     def add_history(self, p): self.history.append(p); return {}
     def add_to_list(self, p): self.lists.append(p); return {}
@@ -108,6 +116,7 @@ def _state_with_snapshot(rows):
     st.set("simkl_snapshot_at", "2026-02-01T00:00:00Z")
     st.set("simkl_activity_all", "2026-02-01T00:00:00Z")
     st.set("simkl_anime_cursor", "2026-02-01T00:00:00Z")
+    st.set("simkl_removed_at", "2026-01-01T00:00:00Z")   # nothing removed yet
     return st
 
 
@@ -168,9 +177,46 @@ def test_tick_one_sided_and_idempotent():
           [len(p["anime"][0]["episodes"]) for p in simkl.history], [12])
 
 
+def test_removal_prunes_the_snapshot():
+    """The 2026-09-11 defect: a title removed on Simkl lived in the snapshot
+    forever and was recreated on AniList on every tick."""
+    print("\n" + "=" * 70 + "\nRECONCILE - a title removed on Simkl is pruned, not resurrected\n" + "=" * 70)
+    gone = sk_row(7, "plantowatch")           # in the snapshot...
+    kept = sk_row(8, "plantowatch")
+    st = _state_with_snapshot([gone, kept])
+    # ...but Simkl's library now holds only `kept`, and says a title left a list
+    simkl = StubSimkl([kept], removed_at="2026-05-05T00:00:00Z")
+    al = StubAniList([], by_mal={7: {"id": 77, "idMal": 7, "title": {"english": "Ghost"}},
+                                 8: {"id": 88, "idMal": 8, "title": {"english": "Real"}}})
+    reconcile_tick(_cfg(), st, simkl, al, None)
+    check("the ghost is not recreated on AniList",
+          [s[0] for s in al.saves], [88])
+    check("the ghost is dropped from the snapshot",
+          sorted(st.get("simkl_anime")), ["8"])
+
+
+def test_absent_from_simkl_catalogue_is_reported_once():
+    print("\n" + "=" * 70 + "\nRECONCILE - an id Simkl does not carry is looked up once, then dropped\n" + "=" * 70)
+    st = _state_with_snapshot([])
+    simkl = StubSimkl([], moved_since=[], catalogue=set())   # catalogue carries nothing
+    al = StubAniList([al_entry(99, 9, "COMPLETED", progress=12, score_1dp=8.0)])
+    reconcile_tick(_cfg(), st, simkl, al, None)
+    check("nothing was pushed to Simkl",
+          (simkl.history, simkl.lists, simkl.ratings), ([], [], []))
+    check("the catalogue was consulted once", simkl.lookups, [9])
+    check("the lookup result is cached", sorted(st.get("simkl_catalogue")), ["9"])
+
+    reconcile_tick(_cfg(), st, simkl, al, None)
+    check("second tick does not look it up again", simkl.lookups, [9])
+    check("second tick still writes nothing",
+          (simkl.history, simkl.lists, simkl.ratings), ([], [], []))
+
+
 def main():
     for fn in (test_unit_reconcile_one, test_tick_simkl_moved_wins,
-               test_tick_anilist_moved_wins, test_tick_one_sided_and_idempotent):
+               test_tick_anilist_moved_wins, test_tick_one_sided_and_idempotent,
+               test_removal_prunes_the_snapshot,
+               test_absent_from_simkl_catalogue_is_reported_once):
         fn()
     print("\n" + "=" * 70)
     if FAILURES:

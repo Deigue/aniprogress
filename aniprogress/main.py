@@ -160,45 +160,35 @@ def simkl_snapshot(st: State) -> dict[str, dict]:
     return snap if isinstance(snap, dict) else {}
 
 
-def update_simkl_snapshot(st: State, entries: list[dict]) -> int:
-    """Merge an incremental Simkl pull into the snapshot. Returns rows touched."""
-    snap = dict(simkl_snapshot(st))
+def _rows_of(entries: list[dict]) -> dict[str, dict]:
+    """Simkl entries -> snapshot rows keyed by MAL id."""
+    rows: dict[str, dict] = {}
     for e in entries:
-        ids = Simkl.ids_of(e)
-        mal_id = _int_or_none(ids.get("mal"))
+        mal_id = _int_or_none(Simkl.ids_of(e).get("mal"))
         if mal_id is None:
             continue
-        snap[str(mal_id)] = {
+        rows[str(mal_id)] = {
             "progress": _progress_of(e),
             "status": str(e.get("status") or ""),
             "rating": _score_1dp(e.get("user_rating")),
         }
-    st.set("simkl_anime", snap)
-    return len(entries)
+    return rows
 
 
-_KEEP = object()
+def update_simkl_snapshot(st: State, entries: list[dict], *,
+                          replace: bool = False) -> None:
+    """Fold a Simkl pull into the snapshot.
 
+    `replace=True` for a full (epoch-anchored) read: the result IS Simkl's whole
+    library, so rows absent from it have been removed and must be dropped.
+    Merging a full read instead is what let deleted titles live in the snapshot
+    forever and get recreated on AniList every tick.
 
-def _snap_write(st: State, mal_id: int, *, progress=_KEEP, status=_KEEP,
-                rating=_KEEP) -> None:
-    """Fold a write we just made into the Simkl snapshot, so the next reconcile
-    does not re-detect it as pending before the incremental pull catches up.
-
-    Merges into the existing row - several writes for one title can land in one
-    tick (progress, then rating), and each must keep the others' fields. Pass
-    only what changed; omitted fields are left as they were.
+    `replace=False` for an incremental pull, which only carries what changed -
+    absence there means "unchanged", not "gone".
     """
-    snap = dict(simkl_snapshot(st))
-    row = dict(snap.get(str(int(mal_id))) or {})
-    if progress is not _KEEP:
-        row["progress"] = int(progress)
-    if status is not _KEEP:
-        row["status"] = status
-    if rating is not _KEEP:
-        row["rating"] = rating
-    snap[str(int(mal_id))] = row
-    st.set("simkl_anime", snap)
+    rows = _rows_of(entries)
+    st.set("simkl_anime", rows if replace else {**simkl_snapshot(st), **rows})
 
 
 def _remember(cfg: Config, st: State, target: str, key: str, signature) -> None:
@@ -219,8 +209,10 @@ def _int_or_none(v):
 
 
 def _al_title(media: dict) -> str:
+    """English name first - it is what makes a log line scannable. Romaji is
+    the fallback, since AniList leaves `english` null on plenty of entries."""
     t = media.get("title") or {}
-    return str(t.get("romaji") or t.get("english") or f"anilist:{media.get('id')}")
+    return str(t.get("english") or t.get("romaji") or f"anilist:{media.get('id')}")
 
 
 # --------------------------------------------------------------------------- #
@@ -230,8 +222,8 @@ def reconcile_tick(
     cfg: Config, st: State, simkl: Simkl, anilist: AniList | None, mal: Mal | None
 ) -> None:
     """One reconcile of Simkl and AniList: read each side once, decide every
-    write in both directions from `reconcile_one`, execute them. The Simkl
-    incremental pull (date_from) doubles as the "which side moved" signal that
+    write in both directions from `reconcile_one`, execute them. Diffing the
+    Simkl snapshot across the pull gives the "which side moved" signal that
     settles a bare status disagreement.
     """
     if not (anilist and cfg.enable_anilist):
@@ -239,34 +231,56 @@ def reconcile_tick(
     dry = "[DRY-RUN] " if cfg.dry_run else ""
     push_simkl = bool(cfg.enable_simkl_push)
 
-    # --- Simkl: snapshot (full, last known) + incremental (what just moved) ---
+    # --- Simkl ---------------------------------------------------------------
     acts = simkl.activities()
     if not acts:
         return
     newest = acts.get("all") or ""
+    removed_at = str((acts.get("anime") or {}).get("removed_from_list") or "")
     have_snapshot = bool(st.get("simkl_snapshot_at"))
-    simkl_moved: set[int] = set()
-    if not have_snapshot or (newest and newest != st.get("simkl_activity_all")):
+    before = simkl_snapshot(st)
+
+    # A removal is invisible to an incremental pull: the row simply stops coming
+    # back, and absence cannot be merged. Simkl publishes when something left a
+    # list, so re-read the library in full whenever that moves and REPLACE the
+    # snapshot, which is the only thing that prunes a deleted title. Without
+    # this a removed title is recreated on AniList on every tick, forever.
+    full = (not have_snapshot) or removed_at != str(st.get("simkl_removed_at") or "")
+    if full or (newest and newest != st.get("simkl_activity_all")):
         date_from = (
-            cfg.simkl_epoch if not have_snapshot
+            cfg.simkl_epoch if full
             else (st.get("simkl_anime_cursor") or cfg.simkl_epoch)
         )
-        if not have_snapshot:
-            log.info("%sbuilding first Simkl snapshot from %s", dry, date_from)
-        recent = Simkl.anime_entries(simkl.all_items("anime", date_from=date_from))
-        if have_snapshot:
-            for e in recent:
-                m = _int_or_none(Simkl.ids_of(e).get("mal"))
-                if m is not None:
-                    simkl_moved.add(m)
-        update_simkl_snapshot(st, recent)
+        if full:
+            log.info("%sfull Simkl re-read from %s (%s)", dry, date_from,
+                     "first run" if not have_snapshot else "a title left a list")
+        rows = Simkl.anime_entries(simkl.all_items("anime", date_from=date_from))
+        update_simkl_snapshot(st, rows, replace=full)
         st.set("simkl_snapshot_at", newest or date_from)
+        st.set("simkl_removed_at", removed_at)
         if newest:
             st.set("simkl_activity_all", newest)
             st.set("simkl_anime_cursor", newest)
         st.save()
 
     snap = simkl_snapshot(st)
+
+    # Who moved? Diff the snapshot across the pull rather than trusting "it came
+    # back in the incremental read" - a row returns for any change at all, and a
+    # rating edit is not evidence the STATUS moved. On the first run there is no
+    # before-state, so nothing counts as moved.
+    simkl_moved: set[int] = set()
+    if have_snapshot:
+        for key, row in snap.items():
+            prev = before.get(key)
+            if prev is None or (prev.get("status") or "") != (row.get("status") or ""):
+                m = _int_or_none(key)
+                if m is not None:
+                    simkl_moved.add(m)
+    if full and have_snapshot:
+        gone = len(before) - len([k for k in before if k in snap])
+        if gone:
+            log.info("%spruned %d title(s) no longer on Simkl", dry, gone)
 
     # --- AniList: one read ---------------------------------------------------
     try:
@@ -298,7 +312,18 @@ def reconcile_tick(
     sk_stat: list[str] = []
     sk_rate: list[str] = []
     unmatched: list[str] = []
+    not_in_simkl: list[str] = []
     mal_writes: list[str] = []
+
+    # Does Simkl's catalogue carry this MAL id? A write for one it does not is
+    # accepted and silently does nothing, so such a title would be "pending" on
+    # every tick forever. Both answers are cached: a miss so it is never retried
+    # or re-reported, a hit so the lookup is not repeated every cycle (in dry run
+    # the push never lands, so nothing else would ever stop it). This is a fact
+    # about Simkl's catalogue, not a record of anything we did, so it is kept in
+    # dry run too.
+    cat: dict = dict(st.get("simkl_catalogue") or {})
+    cat_new = False
 
     for m in sorted(set(snap) | {str(x) for x in al_by_mal}):
         mal_id = _int_or_none(m)
@@ -323,6 +348,22 @@ def reconcile_tick(
                  else f"mal:{mal_id}")
         media_id = _int_or_none((al_entry or {}).get("media", {}).get("id"))
 
+        # Everything we would send to Simkl for a title Simkl has never held
+        # depends on the catalogue knowing the id. Check once, then drop the
+        # Simkl-bound intents for good.
+        if sk is None and any(i[0].startswith("sk_") for i in intents):
+            known = cat.get(str(mal_id))
+            if known is None:
+                known = bool(simkl.in_catalogue(mal_id))
+                cat[str(mal_id)] = known
+                cat_new = True
+                if not known:
+                    not_in_simkl.append(f"{title} (mal:{mal_id})")
+            if not known:
+                intents = [i for i in intents if not i[0].startswith("sk_")]
+            if not intents:
+                continue
+
         for intent in intents:
             kind = intent[0]
             if kind == "al_new":
@@ -332,8 +373,8 @@ def reconcile_tick(
                 if new_id is None:
                     unmatched.append(f"{title} (mal:{mal_id})")
                     break
-                if media and (media.get("title") or {}).get("romaji"):
-                    title = media["title"]["romaji"]
+                if media:
+                    title = _al_title(media)
                 anilist.save(new_id, status=s, progress=p, score_1dp=sc)
                 al_new.append(f"{title} -> {s or '-'} ep{p}"
                               + (f" @{sc}" if sc is not None else ""))
@@ -350,30 +391,26 @@ def reconcile_tick(
                 if sc is not None:
                     bits.append(f"rating {sc}")
                 al_upd.append(f"{title} ({', '.join(bits)})")
+            # Nothing folds a write back into the snapshot. Recording what we
+            # MEANT to send left rows that Simkl never agreed with, and nothing
+            # ever corrected them. A write moves Simkl's activity timestamp, so
+            # the next tick pulls the real result and the snapshot becomes true
+            # rather than hopeful.
             elif kind == "sk_hist":
                 _, p = intent
                 simkl.add_history({"anime": [{
                     "ids": {"mal": mal_id},
                     "episodes": [{"number": n} for n in range(1, p + 1)],
                 }]})
-                if not cfg.dry_run:
-                    _snap_write(st, mal_id, progress=p,
-                                status=AL_TO_SIMKL.get((al or {}).get("status") or "",
-                                                       "watching"))
                 sk_prog.append(f"{title} (ep{(sk or {}).get('progress', 0)}->ep{p})")
             elif kind == "sk_list":
                 _, target = intent
                 simkl.add_to_list({"anime": [{"ids": {"mal": mal_id}, "to": target}]})
-                if not cfg.dry_run:
-                    _snap_write(st, mal_id, status=target,
-                                progress=(sk or {}).get("progress", 0))
                 was = (sk or {}).get("status") or "new"
                 sk_stat.append(f"{title} ({was} -> {target})")
             elif kind == "sk_rate":
                 _, r = intent
                 simkl.add_rating({"anime": [{"ids": {"mal": mal_id}, "rating": r}]})
-                if not cfg.dry_run:
-                    _snap_write(st, mal_id, rating=r)
                 sk_rate.append(f"{title} (rating -> {r})")
             elif kind == "unmatched":
                 unmatched.append(f"{title} (mal:{mal_id})")
@@ -387,8 +424,30 @@ def reconcile_tick(
                 _remember(cfg, st, "mal", str(mal_id), sig)
                 mal_writes.append(f"{title} (ep{al['progress']} {al['status']})")
 
-    work = (al_upd, al_new, sk_prog, sk_stat, sk_rate, mal_writes, unmatched)
-    if not any(work):
+    if cat_new:
+        st.set("simkl_catalogue", cat)
+    absent = sum(1 for v in cat.values() if not v)
+
+    # Permanent facts about the two catalogues: a title one side simply does not
+    # carry cannot change from tick to tick, so name it once and keep only the
+    # count thereafter. Repeating them every cycle is what buries the real work.
+    said = dict(st.get("reported") or {})
+
+    def _once(kind: str, items: list[str]) -> list[str]:
+        seen = dict(said.get(kind) or {})
+        fresh = [t for t in items if t not in seen]
+        if fresh:
+            seen.update({t: True for t in fresh})
+            said[kind] = seen
+        return fresh
+
+    new_unmatched = _once("no_anilist_media", unmatched)
+    new_no_mal = _once("no_mal_id", al_no_mal)
+    st.set("reported", said)
+
+    writes = len(al_new) + len(al_upd) + len(sk_prog) + len(sk_stat) + len(sk_rate)
+    noise = new_unmatched + new_no_mal + not_in_simkl
+    if not (writes or mal_writes or noise):
         log.info("%sRECONCILE ok - %d AniList / %d Simkl, in sync", dry,
                  len(al_by_mal), len(snap))
         st.save()
@@ -405,15 +464,17 @@ def reconcile_tick(
         log.info("%sSK <- rating   %s", dry, t)
     for t in mal_writes:
         log.info("%sMAL <-  %s", dry, t)
-    for t in unmatched:
-        log.info("%s??  no AniList media %s", dry, t)
-    for t in al_no_mal:
-        log.info("%s??  no MAL id %s", dry, t)
+    for t in not_in_simkl:
+        log.info("%s--  not in Simkl's catalogue, never retried: %s", dry, t)
+    for t in new_unmatched:
+        log.info("%s--  no AniList entry exists: %s", dry, t)
+    for t in new_no_mal:
+        log.info("%s--  no MAL id, cannot reach Simkl: %s", dry, t)
     log.info(
         "%sRECONCILE: AniList %d new / %d updated, Simkl %d progress / %d status / "
-        "%d rating, %d unmatched",
+        "%d rating | skipped %d not-in-Simkl, %d no-AniList, %d no-MAL-id",
         dry, len(al_new), len(al_upd), len(sk_prog), len(sk_stat), len(sk_rate),
-        len(unmatched),
+        absent, len(unmatched), len(al_no_mal),
     )
     st.save()
 
@@ -614,10 +675,21 @@ def main() -> int:
         len(snap),
         st.get("simkl_anime_cursor") or "-",
     )
+    # Drop anything a previous design left behind. Only MAL still needs a
+    # write-cache (it has no list-read API); an "already wrote this to AniList /
+    # Simkl" record is exactly the kind of remembered decision that drifted from
+    # reality, and reconcile no longer consults one.
     stale = [k for k in ("anilist_updated_at",) if st.get(k) is not None]
-    if stale:
-        for k in stale:
+    written = st.get("written") or {}
+    dead = [t for t in ("anilist", "simkl", "simkl_status", "anilist_rating")
+            if t in written]
+    if dead:
+        st.set("written", {k: v for k, v in written.items() if k not in dead})
+        stale += [f"written.{t}" for t in dead]
+    for k in ("anilist_updated_at",):
+        if st.get(k) is not None:
             st.set(k, None)
+    if stale:
         st.save()
         log.info("state: dropped keys from a previous design: %s", ", ".join(stale))
 

@@ -32,11 +32,13 @@ class FakeSimkl:
         self.history, self.lists, self.ratings = [], [], []
 
     def activities(self):
-        return {"all": "2026-09-03T22:17:00Z"}
+        return {"all": "2026-09-03T22:17:00Z",
+                "anime": {"removed_from_list": "2026-09-01T00:00:00Z"}}
 
     def all_items(self, media_type="anime", status=None, date_from=None, extended="full"):
         return {"anime": self._anime}
 
+    def in_catalogue(self, mal_id): return True
     def add_history(self, p): self.history.append(p); return {}
     def add_to_list(self, p): self.lists.append(p); return {}
     def add_rating(self, p): self.ratings.append(p); return {}

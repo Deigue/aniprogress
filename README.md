@@ -21,7 +21,12 @@ is the dedup: once a write lands the sides agree and the next pass is a no-op.
   completed AniList entry is a deliberate "I'll rewatch this" marker — AniList is left
   alone. A real completion still arrives as progress.
 - A title present on one side and missing on the other is **created** on the other, at
-  whatever state it holds.
+  whatever state it holds — unless Simkl's catalogue has no such MAL id, in which case a
+  write would be accepted and silently do nothing, so it is reported once and skipped
+  from then on.
+- **Removing a title works.** Simkl publishes when something leaves a list; the whole
+  library is re-read and the snapshot **replaced** so a deleted title is dropped rather
+  than resurrected on the other side.
 
 It does not write progress into Floppy. Floppy has its own scheduled Simkl import.
 

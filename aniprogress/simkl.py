@@ -74,6 +74,22 @@ class Simkl:
                         media_type)
         return self._req("GET", path, params)
 
+    def in_catalogue(self, mal_id: int) -> bool:
+        """Does Simkl's catalogue carry this MAL id at all?
+
+        A write for an id Simkl has never heard of is accepted and silently does
+        nothing, so without this check such a title is "pending" forever. An
+        empty list is a definite no; a transport failure is not, so that is
+        reported as unknown-but-present rather than blocking the write.
+        """
+        try:
+            res = self._req("GET", "/search/id", params={"mal": str(int(mal_id))})
+        except (HTTPError, URLError, TimeoutError, RuntimeError, ValueError) as e:
+            log.warning("simkl catalogue lookup for mal:%s failed (%s) - "
+                        "assuming present", mal_id, e)
+            return True
+        return bool(res)
+
     # --- writes --------------------------------------------------------------
     def add_history(self, payload: dict) -> Any:
         """POST /sync/history - payload shaped as {"anime":[{ids:{...}, ...}]}."""
