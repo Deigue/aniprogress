@@ -101,12 +101,15 @@ def reconcile_one(al: dict | None, sk: dict | None, *, moved: bool,
         return out
     if sk is None:
         if push_simkl:
+            # History AND the status. Simkl derives a status from the episodes it
+            # is given - one episode of a show you dropped reads as "watching" -
+            # and the next tick would copy that derived status back over AniList's
+            # real one. Stating the status explicitly closes that loop.
             if int(al["progress"] or 0) > 0:
                 out.append(("sk_hist", int(al["progress"])))
-            else:
-                t = AL_TO_SIMKL.get(al["status"])
-                if t:
-                    out.append(("sk_list", t))
+            t = AL_TO_SIMKL.get(al["status"])
+            if t:
+                out.append(("sk_list", t))
             if al["score"] is not None:
                 out.append(("sk_rate", max(1, min(10, round(al["score"])))))
         return out
@@ -140,6 +143,12 @@ def reconcile_one(al: dict | None, sk: dict | None, *, moved: bool,
         if al_prog > sk_prog:
             if push_simkl and not sk_done:
                 out.append(("sk_hist", al_prog))
+                # Same reason as above: say the status too when Simkl's would not
+                # match, so pushing episodes of a dropped or paused show does not
+                # come back as "watching".
+                t = AL_TO_SIMKL.get(al_status)
+                if t and t != (sk["status"] or ""):
+                    out.append(("sk_list", t))
         elif sk_prog > al_prog:
             out.append(("al", sk_status, sk_prog, None))
         elif sk_status and sk_status != al_status:
@@ -176,6 +185,13 @@ def simkl_snapshot(st: State) -> dict[str, dict]:
     """
     snap = st.get("simkl_anime") or {}
     return snap if isinstance(snap, dict) else {}
+
+
+# Bump whenever a snapshot row gains or changes a field. The snapshot is only
+# ever reshaped by a full read, so without this a new field stays absent - and a
+# rule that depends on it (the "finished" test needs `total`) silently never
+# fires against rows written by an older build.
+_SNAPSHOT_SCHEMA = 2
 
 
 def _rows_of(entries: list[dict]) -> dict[str, dict]:
@@ -293,9 +309,18 @@ def reconcile_tick(
     # calling all-items WITHOUT a date_from and without checking /sync/activities
     # first; both are always honoured here. What is left is frequency, and
     # SIMKL_FULL_MIN_HOURS keeps it to a handful a day instead of every tick.
-    want_full = (not have_snapshot) or removed_at != str(st.get("simkl_removed_at") or "")
+    # The snapshot's shape is set by the code that wrote it and the date floor it
+    # was read with, so a change to either makes every existing row suspect. That
+    # is not "slightly stale", it is wrong, so it re-reads regardless of the rate
+    # limit: a 2010 floor had hidden 41 titles, and the fix could not reach the
+    # snapshot because a rebuild only ever fired on a removal.
+    shape = f"{_SNAPSHOT_SCHEMA}|{cfg.simkl_epoch}"
+    reshape = have_snapshot and str(st.get("simkl_snapshot_shape") or "") != shape
+    removed = removed_at != str(st.get("simkl_removed_at") or "")
+    want_full = (not have_snapshot) or reshape or removed
     since_full = time.time() - float(st.get("simkl_full_at") or 0)
-    full = want_full and (not have_snapshot or since_full >= cfg.simkl_full_min_hours * 3600)
+    full = want_full and (not have_snapshot or reshape
+                          or since_full >= cfg.simkl_full_min_hours * 3600)
     if want_full and not full:
         log.info("%sa title left a Simkl list; full re-read deferred %.1fh "
                  "(SIMKL_FULL_MIN_HOURS=%s)", dry,
@@ -309,7 +334,8 @@ def reconcile_tick(
         )
         if full:
             log.info("%sfull Simkl re-read from %s (%s)", dry, date_from,
-                     "first run" if not have_snapshot else "a title left a list")
+                     "first run" if not have_snapshot else
+                     "snapshot shape changed" if reshape else "a title left a list")
         rows = Simkl.anime_entries(simkl.all_items("anime", date_from=date_from))
         update_simkl_snapshot(st, rows, replace=full)
         st.set("simkl_snapshot_at", newest or date_from)
@@ -317,6 +343,7 @@ def reconcile_tick(
             # Only record the removal cursor once the prune actually happened,
             # so a deferred removal still fires at the next allowed window.
             st.set("simkl_removed_at", removed_at)
+            st.set("simkl_snapshot_shape", shape)
             st.set("simkl_full_at", time.time())
         if newest:
             st.set("simkl_activity_all", newest)

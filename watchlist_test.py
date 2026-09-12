@@ -22,7 +22,8 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from aniprogress.config import Config                    # noqa: E402
-from aniprogress.main import reconcile_one, reconcile_tick  # noqa: E402
+from aniprogress.main import (_SNAPSHOT_SCHEMA, reconcile_one,  # noqa: E402
+                              reconcile_tick)
 from aniprogress.simkl import Simkl                      # noqa: E402
 from aniprogress.state import State                      # noqa: E402
 
@@ -119,6 +120,7 @@ def _state_with_snapshot(rows):
     st.set("simkl_activity_all", "2026-02-01T00:00:00Z")
     st.set("simkl_anime_cursor", "2026-02-01T00:00:00Z")
     st.set("simkl_removed_at", "2026-01-01T00:00:00Z")   # nothing removed yet
+    st.set("simkl_snapshot_shape", f"{_SNAPSHOT_SCHEMA}|{Config().simkl_epoch}")
     return st
 
 

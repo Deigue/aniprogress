@@ -274,7 +274,7 @@ def test_reconcile_one_sided() -> None:
     check("AniList-only completed -> sk_hist",
           reconcile_one({"status": "COMPLETED", "progress": 12, "score": 8.0, "total": 24}, None,
                         moved=False, rewatch=False, push_simkl=True),
-          [("sk_hist", 12), ("sk_rate", 8)])
+          [("sk_hist", 12), ("sk_list", "completed"), ("sk_rate", 8)])
     # On AniList only, plan-to-watch -> add_to_list
     check("AniList-only planning -> sk_list plantowatch",
           reconcile_one({"status": "PLANNING", "progress": 0, "score": None, "total": 24}, None,

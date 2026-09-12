@@ -23,6 +23,9 @@ is the dedup: once a write lands the sides agree and the next pass is a no-op.
 - **A rewatch restarting on Simkl** (its episode count going *down* while it is being
   watched) moves the finished AniList entry to `REPEATING` at that episode, and normal
   progress tracking takes over from there.
+- When a title is pushed to Simkl its **status is stated explicitly**, not left for Simkl to
+  infer from the episodes it was given — one episode of a show you dropped reads as
+  "watching" there, and that would come straight back and overwrite your `DROPPED`.
 - A title present on one side and missing on the other is **created** on the other, at
   whatever state it holds — unless Simkl's catalogue has no such MAL id, in which case a
   write would be accepted and silently do nothing, so it is reported once and skipped
@@ -119,7 +122,7 @@ Read the log for a full cycle, then set `DRY_RUN` to `false` and restart.
 | ------------- | ----------------- | ------------------------------------------------------------- |
 | `STATE_DIR`   | `/data`           | Where `state.json` lives — mount it, or every restart rebuilds the Simkl snapshot from scratch. |
 | `SIMKL_EPOCH` | `1970-01-01T00:00:00Z` | `date_from` for a full library read. Must be the real epoch — Simkl filters on *last modified*, and rows with an unset modified date are dropped by any later floor. |
-| `SIMKL_FULL_MIN_HOURS` | `6` | Minimum gap between full library reads (first run, and after a title leaves a list). |
+| `SIMKL_FULL_MIN_HOURS` | `6` | Minimum gap between full library reads (first run, after a title leaves a list, or when the snapshot's shape changes). |
 | `LOG_LEVEL`   | `INFO`            | `DEBUG` to see every decision.                                  |
 | `TZ`          | container default | Set it. Timestamps in logs are otherwise UTC.                   |
 
