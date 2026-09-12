@@ -457,6 +457,42 @@ def test_an_unreachable_anilist_lookup_is_not_reported_as_absent():
     check("the next tick creates it", [s[0] for s in al.saves], [11])
 
 
+def test_one_change_reaches_all_three_in_one_tick():
+    """MAL used to be compared against AniList as READ at the top of the tick,
+    so a change originating on Simkl landed on AniList in tick 1 and only
+    reached MAL in tick 2. It must propagate in a single pass."""
+    print(chr(10) + "=" * 70)
+    print("RECONCILE - one change propagates to every provider in one tick")
+    print("=" * 70)
+
+    class FakeMal:
+        def __init__(self, have): self._have = have; self.writes = []
+        def list_entries(self): return dict(self._have)
+        def update(self, mal_id, **kw): self.writes.append((mal_id, kw)); return {}
+
+    cfg = _cfg(); cfg.enable_mal = True
+
+    # Simkl moved to ep6; AniList and MAL both still sit at ep5.
+    rows = [sk_row(70, "watching", watched=6)]
+    st = _state_with_snapshot([sk_row(70, "watching", watched=5)])
+    al = StubAniList([al_entry(700, 70, "CURRENT", progress=5)])
+    m = FakeMal({70: {"status": "watching", "progress": 5, "score": 0, "total": 24}})
+    reconcile_tick(cfg, st, StubSimkl(rows, moved_since=rows), al, m)
+    check("AniList advanced in this tick", [s[2] for s in al.saves], [6])
+    check("and so did MAL, same tick", m.writes, [(70, {"progress": 6})])
+
+    # A title Simkl has that neither of the others do: created on both at once.
+    rows = [sk_row(71, "completed", watched=12, total=12)]
+    st = _state_with_snapshot([])
+    al = StubAniList([], by_mal={71: {"id": 711, "title": {"romaji": "New"}}})
+    m = FakeMal({})
+    reconcile_tick(cfg, st, StubSimkl(rows, moved_since=rows), al, m)
+    check("AniList got the create", [(s[0], s[1], s[2]) for s in al.saves],
+          [(711, "COMPLETED", 12)])
+    check("MAL got it in the same tick too",
+          m.writes, [(71, {"status": "COMPLETED", "progress": 12})])
+
+
 def main():
     for fn in (test_unit_reconcile_one, test_episode_count_mismatch_is_not_a_push,
                test_rewatch_moves_anilist_to_repeating, test_tick_simkl_moved_wins,
@@ -468,7 +504,8 @@ def main():
                test_mal_is_compared_not_blindly_written,
                test_one_bad_title_does_not_sink_the_tick,
                test_an_unreachable_simkl_catalogue_is_not_cached_as_absent,
-               test_an_unreachable_anilist_lookup_is_not_reported_as_absent):
+               test_an_unreachable_anilist_lookup_is_not_reported_as_absent,
+               test_one_change_reaches_all_three_in_one_tick):
         fn()
     print("\n" + "=" * 70)
     if FAILURES:
