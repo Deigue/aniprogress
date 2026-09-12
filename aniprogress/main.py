@@ -436,6 +436,7 @@ def reconcile_tick(
     unmatched: list[str] = []
     not_in_simkl: list[str] = []
     aliased: list[str] = []
+    failed: list[str] = []
     mal_writes: list[tuple[str, str, str]] = []
 
     # Does Simkl's catalogue carry this MAL id? A write for one it does not is
@@ -478,30 +479,38 @@ def reconcile_tick(
                  else f"mal:{mal_id}")
         media_id = _int_or_none((al_entry or {}).get("media", {}).get("id"))
 
-        # MAL mirrors AniList. Compare, then write only the fields that differ.
-        if mal and cfg.enable_mal and al is not None:
-            have = mal_state.get(mal_id)
-            want_status = MAL_STATUS.get(al["status"])
-            m_status = (have or {}).get("status") or ""
-            m_prog = int((have or {}).get("progress") or 0)
-            m_score = int((have or {}).get("score") or 0)
-            m_total = int((have or {}).get("total") or 0)
-            m_done = bool(m_total) and m_prog >= m_total
-            fields, bits = {}, []
-            if want_status and want_status != m_status:
-                fields["status"] = al["status"]
-                bits.append(f"was {m_status}" if m_status else "new")
-            if al["progress"] > m_prog and not m_done:
-                fields["progress"] = al["progress"]
-                bits.append(f"ep{m_prog}->ep{al['progress']}")
-            if al["score"] is not None and round(al["score"]) != m_score:
-                fields["score_1dp"] = al["score"]
-                bits.append(f"rating {round(al['score'])}")
-            if fields:
-                mal.update(mal_id, **fields)
-                verb = want_status or m_status or "?"
-                mal_writes.append((verb, title, ", ".join(bits)))
+        try:
+            # MAL mirrors AniList. Compare, then write only the fields that differ.
+            if mal and cfg.enable_mal and al is not None:
+                have = mal_state.get(mal_id)
+                want_status = MAL_STATUS.get(al["status"])
+                m_status = (have or {}).get("status") or ""
+                m_prog = int((have or {}).get("progress") or 0)
+                m_score = int((have or {}).get("score") or 0)
+                m_total = int((have or {}).get("total") or 0)
+                m_done = bool(m_total) and m_prog >= m_total
+                fields, bits = {}, []
+                if want_status and want_status != m_status:
+                    fields["status"] = al["status"]
+                    bits.append(f"was {m_status}" if m_status else "new")
+                if al["progress"] > m_prog and not m_done:
+                    fields["progress"] = al["progress"]
+                    bits.append(f"ep{m_prog}->ep{al['progress']}")
+                if al["score"] is not None and round(al["score"]) != m_score:
+                    fields["score_1dp"] = al["score"]
+                    bits.append(f"rating {round(al['score'])}")
+                if fields:
+                    mal.update(mal_id, **fields)
+                    verb = want_status or m_status or "?"
+                    mal_writes.append((verb, title, ", ".join(bits)))
 
+
+        except Exception as e:
+            # One title must never take the rest of the run down with it. A
+            # stalled AniList lookup did exactly that: AniList half created,
+            # Simkl untouched, MAL half filled, and the tick dead mid-loop.
+            log.warning("%s!! %s not synced (%s)", dry, title, e)
+            failed.append(_named(title, mal_id))
 
         if not intents:
             continue
@@ -527,68 +536,75 @@ def reconcile_tick(
             if not intents:
                 continue
 
-        for intent in intents:
-            kind = intent[0]
-            if kind == "al_new":
-                _, s, p, sc = intent
-                media = anilist.by_mal(mal_id)
-                new_id = _int_or_none((media or {}).get("id"))
-                if new_id is None:
+        try:
+            for intent in intents:
+                kind = intent[0]
+                if kind == "al_new":
+                    _, s, p, sc = intent
+                    media = anilist.by_mal(mal_id)
+                    new_id = _int_or_none((media or {}).get("id"))
+                    if new_id is None:
+                        unmatched.append(_named(title, mal_id))
+                        break
+                    if media:
+                        title = _al_title(media)
+                    anilist.save(new_id, status=s, progress=p, score_1dp=sc)
+                    bits = []
+                    if p:
+                        bits.append(f"ep{p}")
+                    if sc is not None:
+                        bits.append(f"@{sc}")
+                    al_new.append((s or "-",
+                                   f"{title} ({' '.join(bits)})" if bits else title))
+                elif kind == "al":
+                    _, s, p, sc = intent
+                    if media_id is None:
+                        continue
+                    anilist.save(media_id, status=s, progress=p, score_1dp=sc)
+                    bits = []
+                    if p is not None:
+                        bits.append(f"ep{al['progress']}->ep{p}")
+                    if s:
+                        bits.append(f"{al['status'] or '-'}->{s}")
+                    if sc is not None:
+                        bits.append(f"rating {sc}")
+                    al_upd.append(f"{title} ({', '.join(bits)})")
+                # Nothing folds a write back into the snapshot. Recording what we
+                # MEANT to send left rows that Simkl never agreed with, and nothing
+                # ever corrected them. A write moves Simkl's activity timestamp, so
+                # the next tick pulls the real result and the snapshot becomes true
+                # rather than hopeful.
+                elif kind == "sk_hist":
+                    _, p = intent
+                    simkl.add_history({"anime": [{
+                        "ids": {"mal": mal_id},
+                        "episodes": [{"number": n} for n in range(1, p + 1)],
+                    }]})
+                    w = sk_writes.setdefault(mal_id, {"title": title})
+                    w["from"] = int((sk or {}).get("progress", 0)); w["to"] = p
+                    n_prog += 1
+                elif kind == "sk_list":
+                    _, target = intent
+                    simkl.add_to_list({"anime": [{"ids": {"mal": mal_id}, "to": target}]})
+                    w = sk_writes.setdefault(mal_id, {"title": title})
+                    w["status"] = target
+                    w["was"] = (sk or {}).get("status") or "new"
+                    n_stat += 1
+                elif kind == "sk_rate":
+                    _, r = intent
+                    simkl.add_rating({"anime": [{"ids": {"mal": mal_id}, "rating": r}]})
+                    w = sk_writes.setdefault(mal_id, {"title": title})
+                    w["rating"] = r
+                    n_rate += 1
+                elif kind == "unmatched":
                     unmatched.append(_named(title, mal_id))
-                    break
-                if media:
-                    title = _al_title(media)
-                anilist.save(new_id, status=s, progress=p, score_1dp=sc)
-                bits = []
-                if p:
-                    bits.append(f"ep{p}")
-                if sc is not None:
-                    bits.append(f"@{sc}")
-                al_new.append((s or "-",
-                               f"{title} ({' '.join(bits)})" if bits else title))
-            elif kind == "al":
-                _, s, p, sc = intent
-                if media_id is None:
-                    continue
-                anilist.save(media_id, status=s, progress=p, score_1dp=sc)
-                bits = []
-                if p is not None:
-                    bits.append(f"ep{al['progress']}->ep{p}")
-                if s:
-                    bits.append(f"{al['status'] or '-'}->{s}")
-                if sc is not None:
-                    bits.append(f"rating {sc}")
-                al_upd.append(f"{title} ({', '.join(bits)})")
-            # Nothing folds a write back into the snapshot. Recording what we
-            # MEANT to send left rows that Simkl never agreed with, and nothing
-            # ever corrected them. A write moves Simkl's activity timestamp, so
-            # the next tick pulls the real result and the snapshot becomes true
-            # rather than hopeful.
-            elif kind == "sk_hist":
-                _, p = intent
-                simkl.add_history({"anime": [{
-                    "ids": {"mal": mal_id},
-                    "episodes": [{"number": n} for n in range(1, p + 1)],
-                }]})
-                w = sk_writes.setdefault(mal_id, {"title": title})
-                w["from"] = int((sk or {}).get("progress", 0)); w["to"] = p
-                n_prog += 1
-            elif kind == "sk_list":
-                _, target = intent
-                simkl.add_to_list({"anime": [{"ids": {"mal": mal_id}, "to": target}]})
-                w = sk_writes.setdefault(mal_id, {"title": title})
-                w["status"] = target
-                w["was"] = (sk or {}).get("status") or "new"
-                n_stat += 1
-            elif kind == "sk_rate":
-                _, r = intent
-                simkl.add_rating({"anime": [{"ids": {"mal": mal_id}, "rating": r}]})
-                w = sk_writes.setdefault(mal_id, {"title": title})
-                w["rating"] = r
-                n_rate += 1
-            elif kind == "unmatched":
-                unmatched.append(_named(title, mal_id))
 
+        except Exception as e:
+            # One title must never take the rest of the run down with it. A
+            # stalled AniList lookup did exactly that: AniList half created,
+            # Simkl untouched, MAL half filled, and the tick dead mid-loop.
+            log.warning("%s!! %s not synced (%s)", dry, title, e)
+            failed.append(_named(title, mal_id))
     if cat_new:
         st.set("simkl_ids", cat)
     absent = sum(1 for v in cat.values() if not v)
@@ -612,7 +628,7 @@ def reconcile_tick(
     st.set("reported", said)
 
     writes = len(al_new) + len(al_upd) + n_prog + n_stat + n_rate
-    noise = new_unmatched + new_no_mal + not_in_simkl + aliased
+    noise = new_unmatched + new_no_mal + not_in_simkl + aliased + failed
     if not (writes or mal_writes or noise):
         sizes = " / ".join(t for n, t in (
             (len(al_by_mal), f"AniList {len(al_by_mal)}"),
@@ -646,6 +662,7 @@ def reconcile_tick(
         log.info("%sMAL <- %-13s %s%s", dry, verb, t, f" ({detail})" if detail else "")
     _grouped(dry, "--  not in Simkl's catalogue, never retried:", not_in_simkl)
     _grouped(dry, "--  Simkl maps this onto a title it already holds, skipped:", aliased)
+    _grouped(dry, "!!  write failed, will retry next tick:", failed)
     _grouped(dry, "--  no AniList entry exists:", new_unmatched)
     _grouped(dry, "--  no MAL id, cannot reach Simkl:", new_no_mal)
     log.info(
@@ -656,6 +673,7 @@ def reconcile_tick(
             ("SIMKL", [(n_prog, f"prog{n_prog}"), (n_stat, f"stat{n_stat}"),
                        (n_rate, f"rate{n_rate}")]),
             ("MAL", [(len(mal_writes), str(len(mal_writes)))]),
+            ("FAIL", [(len(failed), str(len(failed)))]),
             ("skip", [(absent, f"{absent} not-in-SIMKL"),
                       (alias_total, f"{alias_total} aliased"),
                       (len(unmatched), f"{len(unmatched)} no-AniList"),

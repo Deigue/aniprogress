@@ -371,6 +371,31 @@ def test_mal_is_compared_not_blindly_written():
           m.writes, [(70, {"status": "COMPLETED", "progress": 12, "score_1dp": 8.0})])
 
 
+
+def test_one_bad_title_does_not_sink_the_tick():
+    """2026-09-12 live run: a single AniList lookup stalled, the tick died
+    mid-loop and left AniList half created, SIMKL untouched and MAL half filled.
+    A failing title must be counted and stepped over."""
+    print(chr(10) + "=" * 70)
+    print("RECONCILE - one failing title is isolated, the rest still syncs")
+    print("=" * 70)
+    rows = [sk_row(1, "watching", watched=5), sk_row(2, "watching", watched=5)]
+    st = _state_with_snapshot(rows)
+
+    class Boom(StubAniList):
+        def save(self, media_id, **kw):
+            if int(media_id) == 11:
+                raise RuntimeError("anilist request failed after retries")
+            return super().save(media_id, **kw)
+
+    al = Boom([al_entry(11, 1, "CURRENT", progress=1),
+               al_entry(22, 2, "CURRENT", progress=1)])
+    reconcile_tick(_cfg(), st, StubSimkl(rows, moved_since=[]), al, None)
+    ok = [s for s in al.saves if s[0] == 22]
+    check("the healthy title was still written", len(ok), 1)
+    check("the failing one wrote nothing", [s for s in al.saves if s[0] == 11], [])
+
+
 def main():
     for fn in (test_unit_reconcile_one, test_episode_count_mismatch_is_not_a_push,
                test_rewatch_moves_anilist_to_repeating, test_tick_simkl_moved_wins,
@@ -379,7 +404,8 @@ def main():
                test_absent_from_simkl_catalogue_is_reported_once,
                test_full_read_is_rate_limited,
                test_alias_onto_an_existing_entry_is_refused,
-               test_mal_is_compared_not_blindly_written):
+               test_mal_is_compared_not_blindly_written,
+               test_one_bad_title_does_not_sink_the_tick):
         fn()
     print("\n" + "=" * 70)
     if FAILURES:

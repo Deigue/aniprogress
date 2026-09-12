@@ -58,6 +58,33 @@ class AniList:
         self.dry_run = dry_run
         self._viewer_id: int | None = None
         self._mal_cache: dict[int, dict] = {}
+        # AniList reports the remaining budget on every response. Tracking it
+        # lets us wait for the window instead of firing into a 429.
+        self._remaining: int | None = None
+        self._reset_at: float = 0.0
+
+    def _note_budget(self, headers) -> None:
+        try:
+            self._remaining = int(headers.get("X-RateLimit-Remaining"))
+        except (TypeError, ValueError):
+            self._remaining = None
+        try:
+            self._reset_at = float(headers.get("X-RateLimit-Reset") or 0)
+        except (TypeError, ValueError):
+            self._reset_at = 0.0
+
+    def _pace(self) -> None:
+        """Hold off while the budget is nearly spent, rather than firing into a
+        429. AniList does not always send X-RateLimit-Reset, so without one fall
+        back to a slice of the minute-long window instead of a 1s busy-wait."""
+        if self._remaining is None or self._remaining > 2:
+            return
+        wait = (self._reset_at - time.time()) if self._reset_at else 10.0
+        wait = min(max(wait, 1.0), 65.0)
+        log.info("anilist budget nearly spent (%s left), pausing %.0fs",
+                 self._remaining, wait)
+        time.sleep(wait)
+        self._remaining = None
 
     def _gql(self, query: str, variables: dict | None = None) -> dict:
         body = json.dumps({"query": query, "variables": variables or {}}).encode()
@@ -68,16 +95,34 @@ class AniList:
             "User-Agent": "anime-aniprogress/1.0",
         })
         for attempt in range(4):
+            self._pace()
             try:
                 with urlopen(req, timeout=45) as r:
+                    self._note_budget(r.headers)
                     payload = json.loads(r.read().decode())
                 if payload.get("errors"):
                     log.error("anilist errors: %s", payload["errors"])
                 return payload.get("data") or {}
             except HTTPError as e:
                 if e.code == 429:
-                    wait = int(e.headers.get("Retry-After", 60))
-                    log.warning("anilist rate limited, sleeping %ss", wait)
+                    # A real AniList limit carries X-RateLimit-* / Retry-After.
+                    # An nginx or Cloudflare edge 429 carries NEITHER and is
+                    # transient - sleeping the 60s default on one of those cost
+                    # four minutes per title and killed whole ticks, leaving the
+                    # run half applied. Tell them apart.
+                    retry_after = e.headers.get("Retry-After")
+                    remaining = e.headers.get("X-RateLimit-Remaining")
+                    if retry_after or remaining is not None:
+                        self._note_budget(e.headers)
+                        wait = min(int(retry_after or 60), 60)
+                        log.warning("anilist rate limited (%s of %s left), "
+                                    "sleeping %ss", remaining,
+                                    e.headers.get("X-RateLimit-Limit"), wait)
+                    else:
+                        wait = 2 * (2 ** attempt)
+                        log.warning("anilist edge 429 (no rate-limit headers, "
+                                    "transient), retry %d in %ss",
+                                    attempt + 1, wait)
                     time.sleep(wait)
                     continue
                 # AniList sits behind Cloudflare and returns transient 502/520/
@@ -141,10 +186,14 @@ class AniList:
         try:
             media = (self._gql(BY_MAL_QUERY, {"idMal": int(id_mal)}) or {}).get("Media")
         except HTTPError as e:
-            if e.code == 404:
-                media = None
-            else:
+            if e.code != 404:
                 raise
+            media = None          # a real "no such anime" - remember it
+        except (URLError, TimeoutError, RuntimeError) as e:
+            # Could not ask. NOT cached: the answer is unknown, not absent, and
+            # one unreachable lookup must not abort the rest of the tick.
+            log.warning("anilist lookup for mal:%s unavailable (%s)", id_mal, e)
+            return None
         self._mal_cache[id_mal] = media  # cache misses too, so we ask once
         return media
 

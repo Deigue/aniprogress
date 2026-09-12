@@ -39,6 +39,11 @@ PAGE = 1000
 MAX_PAGES = 40
 
 
+class MalWriteFailed(RuntimeError):
+    """A MAL write did not land. Raised so the caller can count it rather than
+    reporting a write that never happened."""
+
+
 class Mal:
     def __init__(self, client_id: str, token: str, refresh_token: str = "",
                  dry_run: bool = True):
@@ -157,9 +162,18 @@ class Mal:
                 if e.code == 429:
                     time.sleep(5 * (attempt + 1))
                     continue
+                # urllib only auto-follows a redirect for GET/HEAD, so a PATCH
+                # that MAL redirects (it does, for some ids) surfaced as an error
+                # and the write was silently lost. Follow it by hand, once.
+                if e.code in (301, 302, 307, 308):
+                    target = e.headers.get("Location")
+                    if target and target != url:
+                        log.debug("mal PATCH %s redirected -> %s", mal_id, target)
+                        url = urllib.parse.urljoin(url, target)
+                        continue
                 log.error("mal PATCH %s -> HTTP %s %s", mal_id, e.code, e.read()[:200])
-                return {}
+                raise MalWriteFailed(f"HTTP {e.code}") from e
             except (URLError, TimeoutError) as e:
                 log.warning("mal transport error (%s), retry %d", e, attempt + 1)
                 time.sleep(2 * (attempt + 1))
-        return {}
+        raise MalWriteFailed("no response after retries")
