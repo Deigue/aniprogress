@@ -191,7 +191,7 @@ def simkl_snapshot(st: State) -> dict[str, dict]:
 # ever reshaped by a full read, so without this a new field stays absent - and a
 # rule that depends on it (the "finished" test needs `total`) silently never
 # fires against rows written by an older build.
-_SNAPSHOT_SCHEMA = 2
+_SNAPSHOT_SCHEMA = 3
 
 
 def _rows_of(entries: list[dict]) -> dict[str, dict]:
@@ -206,6 +206,7 @@ def _rows_of(entries: list[dict]) -> dict[str, dict]:
             "status": str(e.get("status") or ""),
             "rating": _score_1dp(e.get("user_rating")),
             "total": _int_or_none(e.get("total_episodes_count")) or 0,
+            "simkl": _int_or_none(Simkl.ids_of(e).get("simkl")) or 0,
         }
     return rows
 
@@ -407,11 +408,11 @@ def reconcile_tick(
 
     al_upd: list[str] = []
     al_new: list[tuple[str, str]] = []
-    sk_prog: list[str] = []
-    sk_stat: list[str] = []
-    sk_rate: list[str] = []
+    sk_writes: dict[int, dict] = {}      # mal -> one condensed line per title
+    n_prog = n_stat = n_rate = 0
     unmatched: list[str] = []
     not_in_simkl: list[str] = []
+    aliased: list[str] = []
     mal_writes: list[str] = []
 
     # Does Simkl's catalogue carry this MAL id? A write for one it does not is
@@ -421,8 +422,16 @@ def reconcile_tick(
     # the push never lands, so nothing else would ever stop it). This is a fact
     # about Simkl's catalogue, not a record of anything we did, so it is kept in
     # dry run too.
-    cat: dict = dict(st.get("simkl_catalogue") or {})
+    # MAL id -> the Simkl id a write for it would actually land on (0 = Simkl
+    # has no such title). Simkl maps a special, short or split film to its PARENT
+    # series, so "Simkl knows this id" is not the question - "does it resolve to
+    # something my library does not already hold" is. Nine episodes of "Sword Art
+    # OFFline" would otherwise have been written onto Sword Art Online. Cached
+    # both ways: it is an immutable fact about Simkl's catalogue, and re-looking
+    # up every one of them on every tick is its own problem.
+    cat: dict = dict(st.get("simkl_ids") or {})
     cat_new = False
+    held = {int(r["simkl"]) for r in snap.values() if r.get("simkl")}
 
     for m in sorted(set(snap) | {str(x) for x in al_by_mal}):
         mal_id = _int_or_none(m)
@@ -453,14 +462,19 @@ def reconcile_tick(
         # depends on the catalogue knowing the id. Check once, then drop the
         # Simkl-bound intents for good.
         if sk is None and any(i[0].startswith("sk_") for i in intents):
-            known = cat.get(str(mal_id))
-            if known is None:
-                known = bool(simkl.in_catalogue(mal_id))
-                cat[str(mal_id)] = known
+            target = cat.get(str(mal_id))
+            if target is None:
+                target = simkl.resolve_mal(mal_id) or 0
+                cat[str(mal_id)] = target
                 cat_new = True
-                if not known:
+                if not target:
                     not_in_simkl.append(_named(title, mal_id))
-            if not known:
+                elif int(target) in held:
+                    aliased.append(_named(title, mal_id))
+            if (not target) or int(target) in held:
+                # Either Simkl has no such title, or it resolves to an entry the
+                # library already holds under a different MAL id. Writing would
+                # land on that other entry, so drop every Simkl-bound intent.
                 intents = [i for i in intents if not i[0].startswith("sk_")]
             if not intents:
                 continue
@@ -508,16 +522,22 @@ def reconcile_tick(
                     "ids": {"mal": mal_id},
                     "episodes": [{"number": n} for n in range(1, p + 1)],
                 }]})
-                sk_prog.append(f"{title} (ep{(sk or {}).get('progress', 0)}->ep{p})")
+                w = sk_writes.setdefault(mal_id, {"title": title})
+                w["from"] = int((sk or {}).get("progress", 0)); w["to"] = p
+                n_prog += 1
             elif kind == "sk_list":
                 _, target = intent
                 simkl.add_to_list({"anime": [{"ids": {"mal": mal_id}, "to": target}]})
-                was = (sk or {}).get("status") or "new"
-                sk_stat.append(f"{title} ({was} -> {target})")
+                w = sk_writes.setdefault(mal_id, {"title": title})
+                w["status"] = target
+                w["was"] = (sk or {}).get("status") or "new"
+                n_stat += 1
             elif kind == "sk_rate":
                 _, r = intent
                 simkl.add_rating({"anime": [{"ids": {"mal": mal_id}, "rating": r}]})
-                sk_rate.append(f"{title} (rating -> {r})")
+                w = sk_writes.setdefault(mal_id, {"title": title})
+                w["rating"] = r
+                n_rate += 1
             elif kind == "unmatched":
                 unmatched.append(_named(title, mal_id))
 
@@ -531,8 +551,9 @@ def reconcile_tick(
                 mal_writes.append(f"{title} (ep{al['progress']} {al['status']})")
 
     if cat_new:
-        st.set("simkl_catalogue", cat)
+        st.set("simkl_ids", cat)
     absent = sum(1 for v in cat.values() if not v)
+    alias_total = sum(1 for v in cat.values() if v and int(v) in held)
 
     # Permanent facts about the two catalogues: a title one side simply does not
     # carry cannot change from tick to tick, so name it once and keep only the
@@ -551,8 +572,8 @@ def reconcile_tick(
     new_no_mal = _once("no_mal_id", al_no_mal)
     st.set("reported", said)
 
-    writes = len(al_new) + len(al_upd) + len(sk_prog) + len(sk_stat) + len(sk_rate)
-    noise = new_unmatched + new_no_mal + not_in_simkl
+    writes = len(al_new) + len(al_upd) + n_prog + n_stat + n_rate
+    noise = new_unmatched + new_no_mal + not_in_simkl + aliased
     if not (writes or mal_writes or noise):
         log.info("%sRECONCILE ok - %d AniList / %d Simkl, in sync", dry,
                  len(al_by_mal), len(snap))
@@ -565,22 +586,31 @@ def reconcile_tick(
         _grouped(dry, f"AL new {status}:", names)
     for t in al_upd:
         log.info("%sAL <-   %s", dry, t)
-    for t in sk_prog:
-        log.info("%sSK <- progress %s", dry, t)
-    for t in sk_stat:
-        log.info("%sSK <- status   %s", dry, t)
-    for t in sk_rate:
-        log.info("%sSK <- rating   %s", dry, t)
+    for w in sk_writes.values():
+        # The status is the verb, so progress, status and rating for one title
+        # read as a single sentence instead of three lines that have to be
+        # correlated by eye.
+        verb = w.get("status") or (w.get("was") or "watching")
+        bits = []
+        if "to" in w:
+            bits.append(f"ep{w['from']}->ep{w['to']}")
+        if w.get("status") and w.get("was") not in (None, "new", w["status"]):
+            bits.append(f"was {w['was']}")
+        if w.get("rating") is not None:
+            bits.append(f"rating {w['rating']}")
+        detail = f" ({', '.join(bits)})" if bits else ""
+        log.info("%sSK <- %-11s %s%s", dry, verb, w["title"], detail)
     for t in mal_writes:
         log.info("%sMAL <-  %s", dry, t)
     _grouped(dry, "--  not in Simkl's catalogue, never retried:", not_in_simkl)
+    _grouped(dry, "--  Simkl maps this onto a title it already holds, skipped:", aliased)
     _grouped(dry, "--  no AniList entry exists:", new_unmatched)
     _grouped(dry, "--  no MAL id, cannot reach Simkl:", new_no_mal)
     log.info(
         "%sRECONCILE: AniList %d new / %d updated, Simkl %d progress / %d status / "
-        "%d rating | skipped %d not-in-Simkl, %d no-AniList, %d no-MAL-id",
-        dry, len(al_new), len(al_upd), len(sk_prog), len(sk_stat), len(sk_rate),
-        absent, len(unmatched), len(al_no_mal),
+        "%d rating | skipped %d not-in-Simkl, %d aliased, %d no-AniList, %d no-MAL-id",
+        dry, len(al_new), len(al_upd), n_prog, n_stat, n_rate,
+        absent, alias_total, len(unmatched), len(al_no_mal),
     )
     st.save()
 

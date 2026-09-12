@@ -73,9 +73,11 @@ class StubSimkl:
         full = str(date_from).startswith("1970")
         return {"anime": list(self._rows if full else self._moved)}
 
-    def in_catalogue(self, mal_id):
+    def resolve_mal(self, mal_id):
         self.lookups.append(int(mal_id))
-        return True if self._catalogue is None else int(mal_id) in self._catalogue
+        if self._catalogue is None:
+            return 900000 + int(mal_id)      # a distinct Simkl id per title
+        return (900000 + int(mal_id)) if int(mal_id) in self._catalogue else None
 
     def add_history(self, p): self.history.append(p); return {}
     def add_to_list(self, p): self.lists.append(p); return {}
@@ -208,7 +210,7 @@ def test_absent_from_simkl_catalogue_is_reported_once():
     check("nothing was pushed to Simkl",
           (simkl.history, simkl.lists, simkl.ratings), ([], [], []))
     check("the catalogue was consulted once", simkl.lookups, [9])
-    check("the lookup result is cached", sorted(st.get("simkl_catalogue")), ["9"])
+    check("the lookup result is cached", sorted(st.get("simkl_ids")), ["9"])
 
     reconcile_tick(_cfg(), st, simkl, al, None)
     check("second tick does not look it up again", simkl.lookups, [9])
@@ -298,13 +300,48 @@ def test_full_read_is_rate_limited():
     check("the removal cursor is consumed", st2.get("simkl_removed_at"), "2026-06-06T00:00:00Z")
 
 
+
+def test_alias_onto_an_existing_entry_is_refused():
+    """Simkl resolves a special/short/split film to its PARENT series and still
+    echoes back the mal id asked for. Writing then lands on the parent - nine
+    episodes of "Sword Art OFFline" onto Sword Art Online. All 20 AniList-only
+    titles in the real library did exactly this."""
+    print(chr(10) + "=" * 70)
+    print("RECONCILE - a write that would land on another entry is refused")
+    print("=" * 70)
+    parent = sk_row(11757, "completed", watched=25, total=25)     # in the library
+    st = _state_with_snapshot([parent])
+    st.get("simkl_anime")["11757"]["simkl"] = 37226               # its Simkl id
+
+    class Aliasing(StubSimkl):
+        def resolve_mal(self, mal_id):
+            self.lookups.append(int(mal_id))
+            return 37226          # every lookup maps onto the parent
+
+    simkl = Aliasing([parent], moved_since=[])
+    # the parody short, watched on AniList, absent from Simkl by MAL id
+    al = StubAniList([al_entry(16099, 16099, "COMPLETED", progress=9, score_1dp=3.0),
+                      al_entry(117570, 11757, "COMPLETED", progress=25)])
+    reconcile_tick(_cfg(), st, simkl, al, None)
+    check("nothing was written onto the parent series",
+          (simkl.history, simkl.lists, simkl.ratings), ([], [], []))
+    check("the resolved id was cached", st.get("simkl_ids"), {"16099": 37226})
+
+    n = len(simkl.lookups)
+    reconcile_tick(_cfg(), st, simkl, al, None)
+    check("second tick does not look it up again", len(simkl.lookups), n)
+    check("and still writes nothing",
+          (simkl.history, simkl.lists, simkl.ratings), ([], [], []))
+
+
 def main():
     for fn in (test_unit_reconcile_one, test_episode_count_mismatch_is_not_a_push,
                test_rewatch_moves_anilist_to_repeating, test_tick_simkl_moved_wins,
                test_tick_anilist_moved_wins, test_tick_one_sided_and_idempotent,
                test_removal_prunes_the_snapshot,
                test_absent_from_simkl_catalogue_is_reported_once,
-               test_full_read_is_rate_limited):
+               test_full_read_is_rate_limited,
+               test_alias_onto_an_existing_entry_is_refused):
         fn()
     print("\n" + "=" * 70)
     if FAILURES:

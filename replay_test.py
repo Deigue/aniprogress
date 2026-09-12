@@ -38,7 +38,7 @@ class FakeSimkl:
     def all_items(self, media_type="anime", status=None, date_from=None, extended="full"):
         return {"anime": self._anime}
 
-    def in_catalogue(self, mal_id): return True
+    def resolve_mal(self, mal_id): return 900000 + int(mal_id)
     def add_history(self, p): self.history.append(p); return {}
     def add_to_list(self, p): self.lists.append(p); return {}
     def add_rating(self, p): self.ratings.append(p); return {}

@@ -27,9 +27,11 @@ is the dedup: once a write lands the sides agree and the next pass is a no-op.
   infer from the episodes it was given — one episode of a show you dropped reads as
   "watching" there, and that would come straight back and overwrite your `DROPPED`.
 - A title present on one side and missing on the other is **created** on the other, at
-  whatever state it holds — unless Simkl's catalogue has no such MAL id, in which case a
-  write would be accepted and silently do nothing, so it is reported once and skipped
-  from then on.
+  whatever state it holds — but not blindly. A MAL id is first resolved to the Simkl id a
+  write would actually land on, because Simkl maps a special, short or split film onto its
+  **parent series** while still echoing back the id you asked for. If it has no such title,
+  or resolves onto an entry the library already holds, the write is reported once and
+  skipped for good.
 - **Removing a title works.** Simkl publishes when something leaves a list; the whole
   library is re-read and the snapshot **replaced** so a deleted title is dropped rather
   than resurrected on the other side.
@@ -111,20 +113,20 @@ Read the log for a full cycle, then set `DRY_RUN` to `false` and restart.
 
 ### Cadence
 
-| Variable             | Default | What it does                                              |
-| -------------------- | ------- | -------------------------------------------------------- |
-| `RECONCILE_SECONDS`  | `60`    | How often the Simkl ↔ AniList reconcile runs.            |
-| `RATINGS_SECONDS`    | `900`   | How often the Floppy ↔ AniList ratings pass runs.        |
+| Variable            | Default | What it does                                      |
+| ------------------- | ------- | ------------------------------------------------- |
+| `RECONCILE_SECONDS` | `60`    | How often the Simkl ↔ AniList reconcile runs.     |
+| `RATINGS_SECONDS`   | `900`   | How often the Floppy ↔ AniList ratings pass runs. |
 
 ### Other
 
-| Variable      | Default           | What it does                                                    |
-| ------------- | ----------------- | ------------------------------------------------------------- |
-| `STATE_DIR`   | `/data`           | Where `state.json` lives — mount it, or every restart rebuilds the Simkl snapshot from scratch. |
-| `SIMKL_EPOCH` | `1970-01-01T00:00:00Z` | `date_from` for a full library read. Must be the real epoch — Simkl filters on *last modified*, and rows with an unset modified date are dropped by any later floor. |
-| `SIMKL_FULL_MIN_HOURS` | `6` | Minimum gap between full library reads (first run, after a title leaves a list, or when the snapshot's shape changes). |
-| `LOG_LEVEL`   | `INFO`            | `DEBUG` to see every decision.                                  |
-| `TZ`          | container default | Set it. Timestamps in logs are otherwise UTC.                   |
+| Variable               | Default                | What it does                                                                                                                                                         |
+| ---------------------- | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `STATE_DIR`            | `/data`                | Where `state.json` lives — mount it, or every restart rebuilds the Simkl snapshot from scratch.                                                                      |
+| `SIMKL_EPOCH`          | `1970-01-01T00:00:00Z` | `date_from` for a full library read. Must be the real epoch — Simkl filters on *last modified*, and rows with an unset modified date are dropped by any later floor. |
+| `SIMKL_FULL_MIN_HOURS` | `6`                    | Minimum gap between full library reads (first run, after a title leaves a list, or when the snapshot's shape changes).                                               |
+| `LOG_LEVEL`            | `INFO`                 | `DEBUG` to see every decision.                                                                                                                                       |
+| `TZ`                   | container default      | Set it. Timestamps in logs are otherwise UTC.                                                                                                                        |
 
 ## Before you start
 

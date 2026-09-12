@@ -74,21 +74,33 @@ class Simkl:
                         media_type)
         return self._req("GET", path, params)
 
-    def in_catalogue(self, mal_id: int) -> bool:
-        """Does Simkl's catalogue carry this MAL id at all?
+    def resolve_mal(self, mal_id: int) -> int | None:
+        """MAL id -> the Simkl id Simkl would actually write to, or None.
 
-        A write for an id Simkl has never heard of is accepted and silently does
-        nothing, so without this check such a title is "pending" forever. An
-        empty list is a definite no; a transport failure is not, so that is
-        reported as unknown-but-present rather than blocking the write.
+        Not "does Simkl know this id". Simkl resolves a special, short or split
+        film to its PARENT series and still echoes back the mal id you asked for,
+        so a bare presence check says yes and the write lands on the parent - nine
+        episodes of "Sword Art OFFline" onto Sword Art Online. The caller needs
+        the target id so it can tell a genuine new title from one of those.
+
+        A transport failure is not an answer, so it is reported as unresolvable
+        rather than as absent.
         """
         try:
-            res = self._req("GET", "/search/id", params={"mal": str(int(mal_id))})
+            res = self._req("GET", "/search/id",
+                            params={"mal": str(int(mal_id))})
         except (HTTPError, URLError, TimeoutError, RuntimeError, ValueError) as e:
-            log.warning("simkl catalogue lookup for mal:%s failed (%s) - "
-                        "assuming present", mal_id, e)
-            return True
-        return bool(res)
+            log.warning("simkl lookup for mal:%s failed (%s)", mal_id, e)
+            return None
+        for hit in (res or []):
+            if str(((hit.get("mal") or {}).get("id"))) != str(int(mal_id)):
+                continue          # a fuzzy match, not this title
+            sid = (hit.get("ids") or {}).get("simkl")
+            try:
+                return int(sid)
+            except (TypeError, ValueError):
+                return None
+        return None
 
     # --- writes --------------------------------------------------------------
     def add_history(self, payload: dict) -> Any:
