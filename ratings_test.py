@@ -198,22 +198,22 @@ def test_reconcile_ratings_gapfill() -> None:
     from aniprogress.main import reconcile_one
 
     # AniList rated, Simkl empty -> rounded to Simkl
-    al = {"status": "COMPLETED", "progress": 12, "score": 8.4}
-    sk = {"status": "completed", "progress": 12, "rating": None}
+    al = {"status": "COMPLETED", "progress": 12, "score": 8.4, "total": 24}
+    sk = {"status": "completed", "progress": 12, "rating": None, "total": 24}
     check("AniList decimal -> Simkl rounded",
-          reconcile_one(al, sk, moved=False, push_simkl=True), [("sk_rate", 8)])
+          reconcile_one(al, sk, moved=False, rewatch=False, push_simkl=True), [("sk_rate", 8)])
 
     # Simkl rated, AniList empty -> fills AniList (as 1dp of the int)
-    al = {"status": "COMPLETED", "progress": 12, "score": None}
-    sk = {"status": "completed", "progress": 12, "rating": 9}
+    al = {"status": "COMPLETED", "progress": 12, "score": None, "total": 24}
+    sk = {"status": "completed", "progress": 12, "rating": 9, "total": 24}
     check("Simkl int -> empty AniList slot",
-          reconcile_one(al, sk, moved=False, push_simkl=True),
+          reconcile_one(al, sk, moved=False, rewatch=False, push_simkl=True),
           [("al", None, None, 9.0)])
 
     # Both hold a score -> never touched (AniList keeps its decimal)
-    al = {"status": "COMPLETED", "progress": 12, "score": 5.5}
-    sk = {"status": "completed", "progress": 12, "rating": 9}
-    check("both rated -> nothing", reconcile_one(al, sk, moved=False, push_simkl=True), [])
+    al = {"status": "COMPLETED", "progress": 12, "score": 5.5, "total": 24}
+    sk = {"status": "completed", "progress": 12, "rating": 9, "total": 24}
+    check("both rated -> nothing", reconcile_one(al, sk, moved=False, rewatch=False, push_simkl=True), [])
 
 
 def test_reconcile_progress_and_status() -> None:
@@ -221,30 +221,30 @@ def test_reconcile_progress_and_status() -> None:
     from aniprogress.main import reconcile_one
 
     # AniList ahead on progress -> explicit episode list to Simkl
-    al = {"status": "CURRENT", "progress": 5, "score": None}
-    sk = {"status": "watching", "progress": 2, "rating": None}
+    al = {"status": "CURRENT", "progress": 5, "score": None, "total": 24}
+    sk = {"status": "watching", "progress": 2, "rating": None, "total": 24}
     check("AniList ep5 > Simkl ep2 -> sk_hist 5",
-          reconcile_one(al, sk, moved=False, push_simkl=True), [("sk_hist", 5)])
+          reconcile_one(al, sk, moved=False, rewatch=False, push_simkl=True), [("sk_hist", 5)])
 
     # Simkl ahead on progress -> AniList gets progress + derived status
-    al = {"status": "CURRENT", "progress": 2, "score": None}
-    sk = {"status": "completed", "progress": 12, "rating": None}
+    al = {"status": "CURRENT", "progress": 2, "score": None, "total": 24}
+    sk = {"status": "completed", "progress": 12, "rating": None, "total": 24}
     check("Simkl ep12 > AniList ep2 -> al COMPLETED/12",
-          reconcile_one(al, sk, moved=False, push_simkl=True),
+          reconcile_one(al, sk, moved=False, rewatch=False, push_simkl=True),
           [("al", "COMPLETED", 12, None)])
 
     # Equal progress, status differs, Simkl moved -> Simkl wins onto AniList
-    al = {"status": "CURRENT", "progress": 5, "score": None}
-    sk = {"status": "dropped", "progress": 5, "rating": None}
+    al = {"status": "CURRENT", "progress": 5, "score": None, "total": 24}
+    sk = {"status": "dropped", "progress": 5, "rating": None, "total": 24}
     check("dropped on Simkl (moved) -> AniList DROPPED",
-          reconcile_one(al, sk, moved=True, push_simkl=True),
+          reconcile_one(al, sk, moved=True, rewatch=False, push_simkl=True),
           [("al", "DROPPED", None, None)])
 
     # Equal progress, status differs, Simkl did NOT move -> AniList wins onto Simkl
     check("paused on AniList (Simkl still) -> Simkl hold",
-          reconcile_one({"status": "PAUSED", "progress": 5, "score": None},
-                        {"status": "watching", "progress": 5, "rating": None},
-                        moved=False, push_simkl=True),
+          reconcile_one({"status": "PAUSED", "progress": 5, "score": None, "total": 24},
+                        {"status": "watching", "progress": 5, "rating": None, "total": 24},
+                        moved=False, rewatch=False, push_simkl=True),
           [("sk_list", "hold")])
 
 
@@ -254,15 +254,15 @@ def test_reconcile_completed_floor() -> None:
 
     # Simkl plan-to-watch over a completed AniList entry (rewatch marker) -> nothing
     check("Simkl plantowatch does not un-complete AniList",
-          reconcile_one({"status": "COMPLETED", "progress": 37, "score": None},
-                        {"status": "plantowatch", "progress": 37, "rating": None},
-                        moved=True, push_simkl=True),
+          reconcile_one({"status": "COMPLETED", "progress": 37, "score": None, "total": 24},
+                        {"status": "plantowatch", "progress": 37, "rating": None, "total": 24},
+                        moved=True, rewatch=False, push_simkl=True),
           [])
     # ...even when Simkl shows a lower episode count
     check("Simkl watching/ep1 does not un-complete AniList",
-          reconcile_one({"status": "COMPLETED", "progress": 12, "score": None},
-                        {"status": "watching", "progress": 1, "rating": None},
-                        moved=True, push_simkl=True),
+          reconcile_one({"status": "COMPLETED", "progress": 12, "score": None, "total": 24},
+                        {"status": "watching", "progress": 1, "rating": None, "total": 24},
+                        moved=True, rewatch=False, push_simkl=True),
           [])
 
 
@@ -272,18 +272,18 @@ def test_reconcile_one_sided() -> None:
 
     # On AniList only, watched -> pushed to Simkl as explicit history
     check("AniList-only completed -> sk_hist",
-          reconcile_one({"status": "COMPLETED", "progress": 12, "score": 8.0}, None,
-                        moved=False, push_simkl=True),
+          reconcile_one({"status": "COMPLETED", "progress": 12, "score": 8.0, "total": 24}, None,
+                        moved=False, rewatch=False, push_simkl=True),
           [("sk_hist", 12), ("sk_rate", 8)])
     # On AniList only, plan-to-watch -> add_to_list
     check("AniList-only planning -> sk_list plantowatch",
-          reconcile_one({"status": "PLANNING", "progress": 0, "score": None}, None,
-                        moved=False, push_simkl=True),
+          reconcile_one({"status": "PLANNING", "progress": 0, "score": None, "total": 24}, None,
+                        moved=False, rewatch=False, push_simkl=True),
           [("sk_list", "plantowatch")])
     # On Simkl only -> create on AniList mirroring it
     check("Simkl-only completed -> al_new",
-          reconcile_one(None, {"status": "completed", "progress": 12, "rating": 7},
-                        moved=False, push_simkl=True),
+          reconcile_one(None, {"status": "completed", "progress": 12, "rating": 7, "total": 24},
+                        moved=False, rewatch=False, push_simkl=True),
           [("al_new", "COMPLETED", 12, 7.0)])
 
 

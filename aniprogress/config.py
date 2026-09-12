@@ -34,6 +34,13 @@ def _b(name: str, default: str = "false") -> bool:
     return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _f(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
 def _i(name: str, default: int) -> int:
     try:
         return int(os.environ.get(name, "") or default)
@@ -69,12 +76,21 @@ class Config:
     reconcile_seconds: int = field(default_factory=lambda: _i("RECONCILE_SECONDS", 60))
     ratings_seconds: int = field(default_factory=lambda: _i("RATINGS_SECONDS", 900))
 
-    # The date_from used the very first time, before a cursor exists. Simkl
-    # filters on last-modified, not watch date, so any item in the account was
-    # touched after the account existed - an early floor returns everything
-    # while still passing date_from, which is what Simkl's docs require.
+    # date_from for a full library read. It must be the actual epoch: Simkl
+    # returns rows whose last-modified is at or after this floor, and 41 of a
+    # 255-title library carry a zero/unset modified date, so a 2010 floor
+    # silently returned 214 and made 41 completed shows look absent - which
+    # would have duplicated their history back into Simkl.
     simkl_epoch: str = field(
-        default_factory=lambda: os.environ.get("SIMKL_EPOCH", "2010-01-01T00:00:00Z"))
+        default_factory=lambda: os.environ.get("SIMKL_EPOCH", "1970-01-01T00:00:00Z"))
+
+    # Minimum gap between full library reads. Simkl's rule is about calling
+    # all-items with no date_from and without checking /sync/activities first -
+    # both always honoured here - so what is left to manage is frequency. A full
+    # read only happens on the first run and after a title leaves a list; this
+    # floor keeps that to a few a day rather than one per tick.
+    simkl_full_min_hours: float = field(
+        default_factory=lambda: _f("SIMKL_FULL_MIN_HOURS", 6.0))
 
     dry_run: bool = field(default_factory=lambda: _b("DRY_RUN", "true"))
     state_dir: str = field(default_factory=lambda: os.environ.get("STATE_DIR", "/data"))

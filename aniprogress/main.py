@@ -70,14 +70,15 @@ AL_TO_SIMKL = {
 }
 
 
-def reconcile_one(al: dict | None, sk: dict | None, *,
-                  moved: bool, push_simkl: bool) -> list[tuple]:
+def reconcile_one(al: dict | None, sk: dict | None, *, moved: bool,
+                  rewatch: bool, push_simkl: bool) -> list[tuple]:
     """Decide every write for ONE title from the two live states. Pure.
 
-    `al` = {"status","progress","score"}  (AniList vocab, score 1dp or None)
-    `sk` = {"status","progress","rating"} (Simkl list vocab, rating int or None)
-    `moved` = this title came back in Simkl's incremental pull this tick, i.e.
-              Simkl is the side that just changed it.
+    `al` = {"status","progress","score","total"}   AniList vocab, score 1dp
+    `sk` = {"status","progress","rating","total"}  Simkl list vocab, rating int
+    `moved`   = Simkl's status changed this tick, so Simkl is the side that moved.
+    `rewatch` = Simkl's progress went BACKWARDS this tick. Progress does not
+                un-happen, so that only means a rewatch was started there.
 
     Returns a list of intent tuples:
       ("al_new",  status, progress, score)                  create on AniList
@@ -114,16 +115,30 @@ def reconcile_one(al: dict | None, sk: dict | None, *,
     sk_status = AL_STATUS.get((sk["status"] or "").lower())
     sk_prog = int(sk["progress"] or 0)
 
-    # COMPLETED on AniList is a hard floor. Whatever Simkl shows - plan-to-watch,
-    # "watching" at ep1, a lower episode count - is either a deliberate rewatch
-    # marker or a stale row, and we cannot tell which from the data. So progress
-    # and status are BOTH left alone; a genuine rewatch flowing back as REPEATING
-    # needs Simkl's rewatch fields, which are not wired up yet (TODO). Only a
-    # missing rating is still filled.
-    if al_status != "COMPLETED":
-        # -- progress: monotonic, higher wins ----------------------------
+    # "Finished" means a side reached ITS OWN episode count, never that the two
+    # numbers match. AniList folds in OVAs and splits films into parts, so the
+    # same finished show is 24/24 there and 22/22 on Simkl. Comparing the raw
+    # numbers pushed those five titles on every tick forever, because Simkl
+    # caps at its own total and the gap can never close.
+    al_done = bool(al["total"]) and al_prog >= int(al["total"])
+    sk_done = bool(sk["total"]) and sk_prog >= int(sk["total"])
+
+    # A rewatch restarting on Simkl is the one thing that moves a finished
+    # AniList entry: progress dropped, so mirror it as REPEATING at Simkl's
+    # episode. This has to be tested before the finished-guard below, which
+    # would otherwise hold the entry at COMPLETED forever.
+    if (rewatch and sk_prog < al_prog
+            and sk_status in ("CURRENT", "REPEATING")):
+        out.append(("al", "REPEATING" if al_done or al_status == "COMPLETED"
+                    else sk_status, sk_prog, None))
+
+    # A finished side has seen the whole show. Never push progress at one (the
+    # numbers cannot converge, and a finished-but-plan-to-watch row on Simkl is
+    # a deliberate rewatch marker), and never pull progress from Simkl into a
+    # finished AniList entry.
+    elif al_status != "COMPLETED" and not al_done:
         if al_prog > sk_prog:
-            if push_simkl:
+            if push_simkl and not sk_done:
                 out.append(("sk_hist", al_prog))
         elif sk_prog > al_prog:
             out.append(("al", sk_status, sk_prog, None))
@@ -137,6 +152,9 @@ def reconcile_one(al: dict | None, sk: dict | None, *,
                 t = AL_TO_SIMKL.get(al_status)                # AniList is the mover
                 if t:
                     out.append(("sk_list", t))
+    elif sk_done and sk_status == "COMPLETED" and al_status != "COMPLETED":
+        # Both finished, Simkl says so explicitly and AniList has not caught up.
+        out.append(("al", "COMPLETED", None, None))
 
     # -- rating: fill an empty slot on either side, never overwrite ------
     if al["score"] is not None and sk["rating"] is None and push_simkl:
@@ -171,6 +189,7 @@ def _rows_of(entries: list[dict]) -> dict[str, dict]:
             "progress": _progress_of(e),
             "status": str(e.get("status") or ""),
             "rating": _score_1dp(e.get("user_rating")),
+            "total": _int_or_none(e.get("total_episodes_count")) or 0,
         }
     return rows
 
@@ -208,6 +227,30 @@ def _int_or_none(v):
         return None
 
 
+def _named(title: str, mal_id: int) -> str:
+    """Title plus its MAL id, without repeating the id when that IS the title."""
+    return title if title == f"mal:{mal_id}" else f"{title} (mal:{mal_id})"
+
+
+def _grouped(dry: str, prefix: str, items: list[str], width: int = 108) -> None:
+    """Log like items on shared lines, " / " separated and wrapped.
+
+    A create or a catalogue fact carries no per-title detail worth a line of its
+    own, and forty of them in a column buries the writes that do. Progress,
+    status and rating changes keep one line each - those you read individually.
+    """
+    line = ""
+    for item in items:
+        nxt = f"{line} / {item}" if line else item
+        if line and len(dry) + len(prefix) + len(nxt) + 1 > width:
+            log.info("%s%s %s", dry, prefix, line)
+            line = item
+        else:
+            line = nxt
+    if line:
+        log.info("%s%s %s", dry, prefix, line)
+
+
 def _al_title(media: dict) -> str:
     """English name first - it is what makes a log line scannable. Romaji is
     the fallback, since AniList leaves `english` null on plenty of entries."""
@@ -241,11 +284,24 @@ def reconcile_tick(
     before = simkl_snapshot(st)
 
     # A removal is invisible to an incremental pull: the row simply stops coming
-    # back, and absence cannot be merged. Simkl publishes when something left a
-    # list, so re-read the library in full whenever that moves and REPLACE the
-    # snapshot, which is the only thing that prunes a deleted title. Without
-    # this a removed title is recreated on AniList on every tick, forever.
-    full = (not have_snapshot) or removed_at != str(st.get("simkl_removed_at") or "")
+    # back, and absence cannot be merged. Simkl has no removals feed either -
+    # /sync/all-items/anime/removed_from_list is byte-identical to the plain
+    # feed, the path segment is ignored - so re-reading the library and
+    # REPLACING the snapshot is the only thing that can prune a deleted title.
+    #
+    # That read is expensive, so it is rate limited. Simkl's rule is about
+    # calling all-items WITHOUT a date_from and without checking /sync/activities
+    # first; both are always honoured here. What is left is frequency, and
+    # SIMKL_FULL_MIN_HOURS keeps it to a handful a day instead of every tick.
+    want_full = (not have_snapshot) or removed_at != str(st.get("simkl_removed_at") or "")
+    since_full = time.time() - float(st.get("simkl_full_at") or 0)
+    full = want_full and (not have_snapshot or since_full >= cfg.simkl_full_min_hours * 3600)
+    if want_full and not full:
+        log.info("%sa title left a Simkl list; full re-read deferred %.1fh "
+                 "(SIMKL_FULL_MIN_HOURS=%s)", dry,
+                 (cfg.simkl_full_min_hours * 3600 - since_full) / 3600.0,
+                 cfg.simkl_full_min_hours)
+
     if full or (newest and newest != st.get("simkl_activity_all")):
         date_from = (
             cfg.simkl_epoch if full
@@ -257,7 +313,11 @@ def reconcile_tick(
         rows = Simkl.anime_entries(simkl.all_items("anime", date_from=date_from))
         update_simkl_snapshot(st, rows, replace=full)
         st.set("simkl_snapshot_at", newest or date_from)
-        st.set("simkl_removed_at", removed_at)
+        if full:
+            # Only record the removal cursor once the prune actually happened,
+            # so a deferred removal still fires at the next allowed window.
+            st.set("simkl_removed_at", removed_at)
+            st.set("simkl_full_at", time.time())
         if newest:
             st.set("simkl_activity_all", newest)
             st.set("simkl_anime_cursor", newest)
@@ -269,14 +329,25 @@ def reconcile_tick(
     # back in the incremental read" - a row returns for any change at all, and a
     # rating edit is not evidence the STATUS moved. On the first run there is no
     # before-state, so nothing counts as moved.
+    # A full read rewrites rows to CORRECT our view - titles it had never seen,
+    # values an earlier design had fossilised - so a before/after diff there is
+    # not evidence of anything the user did. Only an incremental pull carries
+    # that meaning, so the rewatch signal is taken from incremental ticks alone.
     simkl_moved: set[int] = set()
-    if have_snapshot:
+    simkl_rewatch: set[int] = set()
+    if have_snapshot and not full:
         for key, row in snap.items():
             prev = before.get(key)
+            m = _int_or_none(key)
+            if m is None:
+                continue
             if prev is None or (prev.get("status") or "") != (row.get("status") or ""):
-                m = _int_or_none(key)
-                if m is not None:
-                    simkl_moved.add(m)
+                simkl_moved.add(m)
+            # Episodes watched do not un-happen. Simkl's count going DOWN means
+            # the show was restarted there - a rewatch - which is the one signal
+            # that may move a finished AniList entry back to REPEATING.
+            if prev is not None and int(row.get("progress") or 0) < int(prev.get("progress") or 0):
+                simkl_rewatch.add(m)
     if full and have_snapshot:
         gone = len(before) - len([k for k in before if k in snap])
         if gone:
@@ -304,10 +375,11 @@ def reconcile_tick(
             "status": str(e.get("status") or ""),
             "progress": int(e.get("progress") or 0),
             "score": round(int(raw) / 10.0, 1) if raw else None,
+            "total": _int_or_none((e.get("media") or {}).get("episodes")) or 0,
         }
 
     al_upd: list[str] = []
-    al_new: list[str] = []
+    al_new: list[tuple[str, str]] = []
     sk_prog: list[str] = []
     sk_stat: list[str] = []
     sk_rate: list[str] = []
@@ -338,9 +410,11 @@ def reconcile_tick(
                 "status": str(srow.get("status") or ""),
                 "progress": int(srow.get("progress") or 0),
                 "rating": srow.get("rating"),
+                "total": int(srow.get("total") or 0),
             }
-        moved = mal_id in simkl_moved
-        intents = reconcile_one(al, sk, moved=moved, push_simkl=push_simkl)
+        intents = reconcile_one(al, sk, moved=mal_id in simkl_moved,
+                                rewatch=mal_id in simkl_rewatch,
+                                push_simkl=push_simkl)
         if not intents:
             continue
 
@@ -358,7 +432,7 @@ def reconcile_tick(
                 cat[str(mal_id)] = known
                 cat_new = True
                 if not known:
-                    not_in_simkl.append(f"{title} (mal:{mal_id})")
+                    not_in_simkl.append(_named(title, mal_id))
             if not known:
                 intents = [i for i in intents if not i[0].startswith("sk_")]
             if not intents:
@@ -371,13 +445,18 @@ def reconcile_tick(
                 media = anilist.by_mal(mal_id)
                 new_id = _int_or_none((media or {}).get("id"))
                 if new_id is None:
-                    unmatched.append(f"{title} (mal:{mal_id})")
+                    unmatched.append(_named(title, mal_id))
                     break
                 if media:
                     title = _al_title(media)
                 anilist.save(new_id, status=s, progress=p, score_1dp=sc)
-                al_new.append(f"{title} -> {s or '-'} ep{p}"
-                              + (f" @{sc}" if sc is not None else ""))
+                bits = []
+                if p:
+                    bits.append(f"ep{p}")
+                if sc is not None:
+                    bits.append(f"@{sc}")
+                al_new.append((s or "-",
+                               f"{title} ({' '.join(bits)})" if bits else title))
             elif kind == "al":
                 _, s, p, sc = intent
                 if media_id is None:
@@ -413,7 +492,7 @@ def reconcile_tick(
                 simkl.add_rating({"anime": [{"ids": {"mal": mal_id}, "rating": r}]})
                 sk_rate.append(f"{title} (rating -> {r})")
             elif kind == "unmatched":
-                unmatched.append(f"{title} (mal:{mal_id})")
+                unmatched.append(_named(title, mal_id))
 
         # MAL mirror - write-only, its own dedup cache (no list-read API).
         if mal and cfg.enable_mal and al is not None:
@@ -452,8 +531,11 @@ def reconcile_tick(
                  len(al_by_mal), len(snap))
         st.save()
         return
-    for t in al_new:
-        log.info("%sAL new  %s", dry, t)
+    by_status: dict[str, list[str]] = {}
+    for status, label in al_new:
+        by_status.setdefault(status, []).append(label)
+    for status, names in by_status.items():
+        _grouped(dry, f"AL new {status}:", names)
     for t in al_upd:
         log.info("%sAL <-   %s", dry, t)
     for t in sk_prog:
@@ -464,12 +546,9 @@ def reconcile_tick(
         log.info("%sSK <- rating   %s", dry, t)
     for t in mal_writes:
         log.info("%sMAL <-  %s", dry, t)
-    for t in not_in_simkl:
-        log.info("%s--  not in Simkl's catalogue, never retried: %s", dry, t)
-    for t in new_unmatched:
-        log.info("%s--  no AniList entry exists: %s", dry, t)
-    for t in new_no_mal:
-        log.info("%s--  no MAL id, cannot reach Simkl: %s", dry, t)
+    _grouped(dry, "--  not in Simkl's catalogue, never retried:", not_in_simkl)
+    _grouped(dry, "--  no AniList entry exists:", new_unmatched)
+    _grouped(dry, "--  no MAL id, cannot reach Simkl:", new_no_mal)
     log.info(
         "%sRECONCILE: AniList %d new / %d updated, Simkl %d progress / %d status / "
         "%d rating | skipped %d not-in-Simkl, %d no-AniList, %d no-MAL-id",

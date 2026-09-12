@@ -17,9 +17,12 @@ is the dedup: once a write lands the sides agree and the next pass is a no-op.
   trusted. For a bare status disagreement at equal progress, Simkl's incremental feed
   says which side just changed it — that side wins. (A rare true simultaneous edit
   resolves toward Simkl and can be redone.)
-- **`COMPLETED` is a floor.** A plan-to-watch or half-watched row on Simkl over a
-  completed AniList entry is a deliberate "I'll rewatch this" marker — AniList is left
-  alone. A real completion still arrives as progress.
+- **Finished means a side reached *its own* episode count**, never that the two numbers
+  match — AniList folds in OVAs and splits films, so the same finished show is 24/24
+  there and 22/22 on Simkl. Neither side is pushed at once it is finished.
+- **A rewatch restarting on Simkl** (its episode count going *down* while it is being
+  watched) moves the finished AniList entry to `REPEATING` at that episode, and normal
+  progress tracking takes over from there.
 - A title present on one side and missing on the other is **created** on the other, at
   whatever state it holds — unless Simkl's catalogue has no such MAL id, in which case a
   write would be accepted and silently do nothing, so it is reported once and skipped
@@ -115,7 +118,8 @@ Read the log for a full cycle, then set `DRY_RUN` to `false` and restart.
 | Variable      | Default           | What it does                                                    |
 | ------------- | ----------------- | ------------------------------------------------------------- |
 | `STATE_DIR`   | `/data`           | Where `state.json` lives — mount it, or every restart rebuilds the Simkl snapshot from scratch. |
-| `SIMKL_EPOCH` | `2010-01-01T00:00:00Z` | `date_from` for the first Simkl read. Raise it to ignore history older than a given date. |
+| `SIMKL_EPOCH` | `1970-01-01T00:00:00Z` | `date_from` for a full library read. Must be the real epoch — Simkl filters on *last modified*, and rows with an unset modified date are dropped by any later floor. |
+| `SIMKL_FULL_MIN_HOURS` | `6` | Minimum gap between full library reads (first run, and after a title leaves a list). |
 | `LOG_LEVEL`   | `INFO`            | `DEBUG` to see every decision.                                  |
 | `TZ`          | container default | Set it. Timestamps in logs are otherwise UTC.                   |
 

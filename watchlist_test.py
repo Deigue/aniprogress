@@ -48,8 +48,9 @@ def al_entry(media_id, id_mal, status, progress=0, score_1dp=None):
     }
 
 
-def sk_row(mal, status, watched=0, rating=None):
+def sk_row(mal, status, watched=0, rating=None, total=24):
     return {"status": status, "watched_episodes_count": watched, "user_rating": rating,
+            "total_episodes_count": total,
             "show": {"title": f"t{mal}", "ids": {"mal": str(mal)}}}
 
 
@@ -68,7 +69,7 @@ class StubSimkl:
 
     def all_items(self, media_type="anime", status=None, date_from=None, extended="full"):
         # date_from == epoch -> full read; otherwise -> "what moved"
-        full = str(date_from).startswith("2010")
+        full = str(date_from).startswith("1970")
         return {"anime": list(self._rows if full else self._moved)}
 
     def in_catalogue(self, mal_id):
@@ -111,6 +112,7 @@ def _state_with_snapshot(rows):
     snap = {str(int(r["show"]["ids"]["mal"])): {
         "progress": int(r.get("watched_episodes_count") or 0),
         "status": r.get("status") or "", "rating": r.get("user_rating"),
+        "total": int(r.get("total_episodes_count") or 0),
     } for r in rows}
     st.set("simkl_anime", snap)
     st.set("simkl_snapshot_at", "2026-02-01T00:00:00Z")
@@ -123,21 +125,21 @@ def _state_with_snapshot(rows):
 def test_unit_reconcile_one():
     print("\n" + "=" * 70 + "\nreconcile_one - the pure decision core\n" + "=" * 70)
     check("progress higher on AniList -> episodes to Simkl",
-          reconcile_one({"status": "CURRENT", "progress": 5, "score": None},
-                        {"status": "watching", "progress": 2, "rating": None},
-                        moved=False, push_simkl=True), [("sk_hist", 5)])
+          reconcile_one({"status": "CURRENT", "progress": 5, "score": None, "total": 24},
+                        {"status": "watching", "progress": 2, "rating": None, "total": 24},
+                        moved=False, rewatch=False, push_simkl=True), [("sk_hist", 5)])
     check("dropped on Simkl (moved) -> AniList DROPPED",
-          reconcile_one({"status": "CURRENT", "progress": 5, "score": None},
-                        {"status": "dropped", "progress": 5, "rating": None},
-                        moved=True, push_simkl=True), [("al", "DROPPED", None, None)])
+          reconcile_one({"status": "CURRENT", "progress": 5, "score": None, "total": 24},
+                        {"status": "dropped", "progress": 5, "rating": None, "total": 24},
+                        moved=True, rewatch=False, push_simkl=True), [("al", "DROPPED", None, None)])
     check("dropped on AniList (Simkl still) -> Simkl dropped",
-          reconcile_one({"status": "DROPPED", "progress": 5, "score": None},
-                        {"status": "watching", "progress": 5, "rating": None},
-                        moved=False, push_simkl=True), [("sk_list", "dropped")])
+          reconcile_one({"status": "DROPPED", "progress": 5, "score": None, "total": 24},
+                        {"status": "watching", "progress": 5, "rating": None, "total": 24},
+                        moved=False, rewatch=False, push_simkl=True), [("sk_list", "dropped")])
     check("COMPLETED floor: Simkl plantowatch changes nothing",
-          reconcile_one({"status": "COMPLETED", "progress": 24, "score": None},
-                        {"status": "plantowatch", "progress": 24, "rating": None},
-                        moved=True, push_simkl=True), [])
+          reconcile_one({"status": "COMPLETED", "progress": 24, "score": None, "total": 24},
+                        {"status": "plantowatch", "progress": 24, "rating": None, "total": 24},
+                        moved=True, rewatch=False, push_simkl=True), [])
 
 
 def test_tick_simkl_moved_wins():
@@ -212,11 +214,95 @@ def test_absent_from_simkl_catalogue_is_reported_once():
           (simkl.history, simkl.lists, simkl.ratings), ([], [], []))
 
 
+def test_episode_count_mismatch_is_not_a_push():
+    """The 2026-09-11 defect: AniList folds in OVAs and splits films, so a
+    finished show is 24/24 there and 22/22 on Simkl. Comparing raw numbers
+    pushed those titles on every tick forever - Simkl caps at its own total."""
+    print(chr(10) + "=" * 70)
+    print("reconcile_one - finished means 'reached ITS OWN total'")
+    print("=" * 70)
+    check("AniList 24/24 vs Simkl 22/22 -> nothing",
+          reconcile_one({"status": "COMPLETED", "progress": 24, "score": None, "total": 24},
+                        {"status": "completed", "progress": 22, "rating": None, "total": 22},
+                        moved=False, rewatch=False, push_simkl=True), [])
+    check("AniList 4/4 film vs Simkl 1/1 film -> nothing",
+          reconcile_one({"status": "COMPLETED", "progress": 4, "score": None, "total": 4},
+                        {"status": "completed", "progress": 1, "rating": None, "total": 1},
+                        moved=False, rewatch=False, push_simkl=True), [])
+    check("finished-but-plantowatch on Simkl is a rewatch marker, not a target",
+          reconcile_one({"status": "COMPLETED", "progress": 23, "score": None, "total": 23},
+                        {"status": "plantowatch", "progress": 22, "rating": None, "total": 22},
+                        moved=False, rewatch=False, push_simkl=True), [])
+    check("genuinely behind on the SAME total still pushes",
+          reconcile_one({"status": "CURRENT", "progress": 11, "score": None, "total": 14},
+                        {"status": "watching", "progress": 10, "rating": None, "total": 14},
+                        moved=False, rewatch=False, push_simkl=True), [("sk_hist", 11)])
+
+
+def test_rewatch_moves_anilist_to_repeating():
+    print(chr(10) + "=" * 70)
+    print("RECONCILE - a rewatch started on Simkl -> AniList REPEATING")
+    print("=" * 70)
+    check("Simkl restarted at ep1 -> AniList REPEATING ep1",
+          reconcile_one({"status": "COMPLETED", "progress": 24, "score": None, "total": 24},
+                        {"status": "watching", "progress": 1, "rating": None, "total": 24},
+                        moved=True, rewatch=True, push_simkl=True),
+          [("al", "REPEATING", 1, None)])
+    check("rewatch in progress keeps tracking forward",
+          reconcile_one({"status": "REPEATING", "progress": 1, "score": None, "total": 24},
+                        {"status": "watching", "progress": 3, "rating": None, "total": 24},
+                        moved=False, rewatch=False, push_simkl=True),
+          [("al", "CURRENT", 3, None)])
+
+    # end to end: the snapshot's progress going backwards is the whole signal
+    st = _state_with_snapshot([sk_row(5, "completed", watched=24)])
+    rows = [sk_row(5, "watching", watched=1)]
+    simkl = StubSimkl(rows, moved_since=rows)
+    al = StubAniList([al_entry(55, 5, "COMPLETED", progress=24)])
+    reconcile_tick(_cfg(), st, simkl, al, None)
+    check("tick detects the reset and writes REPEATING",
+          al.saves, [(55, "REPEATING", 1, None)])
+
+
+
+def test_full_read_is_rate_limited():
+    """A full library read is the expensive call. It must fire on the first run
+    and after a removal, but never more often than SIMKL_FULL_MIN_HOURS."""
+    print(chr(10) + "=" * 70)
+    print("RECONCILE - full re-reads are rate limited")
+    print("=" * 70)
+    import time as _t
+    rows = [sk_row(1, "plantowatch")]
+    cfg = _cfg()
+    cfg.simkl_full_min_hours = 6.0
+    by = {1: {"id": 11, "idMal": 1, "title": {"english": "a"}},
+          2: {"id": 22, "idMal": 2, "title": {"english": "b"}}}
+
+    st = _state_with_snapshot([sk_row(1, "plantowatch"), sk_row(2, "plantowatch")])
+    st.set("simkl_full_at", _t.time())
+    reconcile_tick(cfg, st, StubSimkl(rows, moved_since=[], removed_at="2026-06-06T00:00:00Z"),
+                   StubAniList([], by_mal=by), None)
+    check("inside the window the ghost is NOT pruned",
+          sorted(st.get("simkl_anime")), ["1", "2"])
+    check("the removal cursor is not consumed, so it retries later",
+          st.get("simkl_removed_at"), "2026-01-01T00:00:00Z")
+
+    st2 = _state_with_snapshot([sk_row(1, "plantowatch"), sk_row(2, "plantowatch")])
+    st2.set("simkl_full_at", _t.time() - 7 * 3600)
+    reconcile_tick(cfg, st2, StubSimkl(rows, moved_since=[], removed_at="2026-06-06T00:00:00Z"),
+                   StubAniList([], by_mal=by), None)
+    check("outside the window the ghost is pruned",
+          sorted(st2.get("simkl_anime")), ["1"])
+    check("the removal cursor is consumed", st2.get("simkl_removed_at"), "2026-06-06T00:00:00Z")
+
+
 def main():
-    for fn in (test_unit_reconcile_one, test_tick_simkl_moved_wins,
+    for fn in (test_unit_reconcile_one, test_episode_count_mismatch_is_not_a_push,
+               test_rewatch_moves_anilist_to_repeating, test_tick_simkl_moved_wins,
                test_tick_anilist_moved_wins, test_tick_one_sided_and_idempotent,
                test_removal_prunes_the_snapshot,
-               test_absent_from_simkl_catalogue_is_reported_once):
+               test_absent_from_simkl_catalogue_is_reported_once,
+               test_full_read_is_rate_limited):
         fn()
     print("\n" + "=" * 70)
     if FAILURES:
