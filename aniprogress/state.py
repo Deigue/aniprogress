@@ -1,10 +1,10 @@
-"""Durable cursors and last-written state.
+"""Durable cursors and the Simkl snapshot.
 
-Two jobs:
-  * remember Simkl's activity timestamps so `date_from` stays small (Simkl
-    suspends client_ids that pull full lists repeatedly)
-  * remember what we last wrote to each target, so an unchanged library
-    produces zero writes
+Deliberately NOT a record of what was written. Every target is read before it is
+written, so the comparison of two live libraries is the dedup; a remembered-write
+cache could only disagree with reality, and each time it did it caused an
+incident. What is kept here is Simkl's own data and the cursors that let it be
+re-read cheaply - Simkl suspends client_ids that pull full lists repeatedly.
 """
 from __future__ import annotations
 
@@ -45,14 +45,3 @@ class State:
 
     def set(self, key: str, value: Any) -> None:
         self._d[key] = value
-
-    # --- write deduplication -------------------------------------------------
-    def written(self, target: str, key: str) -> Any:
-        return self._d.setdefault("written", {}).setdefault(target, {}).get(key)
-
-    def mark_written(self, target: str, key: str, value: Any) -> None:
-        self._d.setdefault("written", {}).setdefault(target, {})[key] = value
-
-    def differs(self, target: str, key: str, value: Any) -> bool:
-        """True when this write would actually change something."""
-        return self.written(target, key) != value

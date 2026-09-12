@@ -28,6 +28,7 @@ from .anilist import STATUS_MAP as AL_STATUS
 from .anilist import AniList
 from .config import Config, load_dotenv
 from .floppy import Floppy
+from .mal import STATUS_MAP as MAL_STATUS
 from .mal import Mal
 from .simkl import Simkl
 from .state import State
@@ -227,16 +228,6 @@ def update_simkl_snapshot(st: State, entries: list[dict], *,
     st.set("simkl_anime", rows if replace else {**simkl_snapshot(st), **rows})
 
 
-def _remember(cfg: Config, st: State, target: str, key: str, signature) -> None:
-    """Record a write, unless this was a dry run.
-
-    A dry run performs no write, so recording one makes every later tick skip a
-    change that never happened - and the log stops reporting pending work.
-    """
-    if not cfg.dry_run:
-        st.mark_written(target, key, signature)
-
-
 def _int_or_none(v):
     try:
         return int(v)
@@ -397,6 +388,17 @@ def reconcile_tick(
             continue
         al_by_mal[m] = e
 
+    # MAL is read too, so a write only happens on a real difference. Blind
+    # writes every tick, or a remembered-writes cache, are the two things this
+    # service exists to not do.
+    mal_state: dict[int, dict] = {}
+    if mal and cfg.enable_mal:
+        try:
+            mal_state = mal.list_entries()
+        except Exception:
+            log.exception("%scould not load MAL - skipping its mirror this tick", dry)
+            mal = None
+
     def _al_state(e: dict) -> dict:
         raw = e.get("scoreRaw")
         return {
@@ -413,7 +415,7 @@ def reconcile_tick(
     unmatched: list[str] = []
     not_in_simkl: list[str] = []
     aliased: list[str] = []
-    mal_writes: list[str] = []
+    mal_writes: list[tuple[str, str, str]] = []
 
     # Does Simkl's catalogue carry this MAL id? A write for one it does not is
     # accepted and silently does nothing, so such a title would be "pending" on
@@ -451,12 +453,37 @@ def reconcile_tick(
         intents = reconcile_one(al, sk, moved=mal_id in simkl_moved,
                                 rewatch=mal_id in simkl_rewatch,
                                 push_simkl=push_simkl)
-        if not intents:
-            continue
-
         title = (_al_title(al_entry.get("media") or {}) if al_entry
                  else f"mal:{mal_id}")
         media_id = _int_or_none((al_entry or {}).get("media", {}).get("id"))
+
+        # MAL mirrors AniList. Compare, then write only the fields that differ.
+        if mal and cfg.enable_mal and al is not None:
+            have = mal_state.get(mal_id)
+            want_status = MAL_STATUS.get(al["status"])
+            m_status = (have or {}).get("status") or ""
+            m_prog = int((have or {}).get("progress") or 0)
+            m_score = int((have or {}).get("score") or 0)
+            m_total = int((have or {}).get("total") or 0)
+            m_done = bool(m_total) and m_prog >= m_total
+            fields, bits = {}, []
+            if want_status and want_status != m_status:
+                fields["status"] = al["status"]
+                bits.append(f"was {m_status}" if m_status else "new")
+            if al["progress"] > m_prog and not m_done:
+                fields["progress"] = al["progress"]
+                bits.append(f"ep{m_prog}->ep{al['progress']}")
+            if al["score"] is not None and round(al["score"]) != m_score:
+                fields["score_1dp"] = al["score"]
+                bits.append(f"rating {round(al['score'])}")
+            if fields:
+                mal.update(mal_id, **fields)
+                verb = want_status or m_status or "?"
+                mal_writes.append((verb, title, ", ".join(bits)))
+
+
+        if not intents:
+            continue
 
         # Everything we would send to Simkl for a title Simkl has never held
         # depends on the catalogue knowing the id. Check once, then drop the
@@ -541,15 +568,6 @@ def reconcile_tick(
             elif kind == "unmatched":
                 unmatched.append(_named(title, mal_id))
 
-        # MAL mirror - write-only, its own dedup cache (no list-read API).
-        if mal and cfg.enable_mal and al is not None:
-            sig = f"{al['status']}|{al['progress']}|{al['score']}"
-            if st.differs("mal", str(mal_id), sig):
-                mal.update(mal_id, status=al["status"], progress=al["progress"],
-                           score_1dp=al["score"])
-                _remember(cfg, st, "mal", str(mal_id), sig)
-                mal_writes.append(f"{title} (ep{al['progress']} {al['status']})")
-
     if cat_new:
         st.set("simkl_ids", cat)
     absent = sum(1 for v in cat.values() if not v)
@@ -600,8 +618,8 @@ def reconcile_tick(
             bits.append(f"rating {w['rating']}")
         detail = f" ({', '.join(bits)})" if bits else ""
         log.info("%sSK <- %-11s %s%s", dry, verb, w["title"], detail)
-    for t in mal_writes:
-        log.info("%sMAL <-  %s", dry, t)
+    for verb, t, detail in mal_writes:
+        log.info("%sMAL <- %-13s %s%s", dry, verb, t, f" ({detail})" if detail else "")
     _grouped(dry, "--  not in Simkl's catalogue, never retried:", not_in_simkl)
     _grouped(dry, "--  Simkl maps this onto a title it already holds, skipped:", aliased)
     _grouped(dry, "--  no AniList entry exists:", new_unmatched)
@@ -715,9 +733,8 @@ def ratings_tick(
     st.set("ratings_seen", new_seen)
 
     dry = "[DRY-RUN] " if cfg.dry_run else ""
-    mirror_to_mal = bool(mal and cfg.enable_mal)
     unresolved = [c for c in conflicts if c[3] == "skip"]
-    if not (to_anilist or to_floppy or unresolved or mirror_to_mal):
+    if not (to_anilist or to_floppy or unresolved):
         log.info("%sRATINGS ok - Floppy %d / AniList %d rated, in sync", dry,
                  len(floppy_scores), rated_al)
         st.save()
@@ -739,16 +756,6 @@ def ratings_tick(
         title = _al_title((anilist_by_mal.get(mal_id) or {}).get("media") or {})
         why = next((c[3] for c in conflicts if c[0] == mal_id), "gap")
         log.info("%sRATE ->Floppy  %s = %s (%s)", dry, title, score, why)
-
-    if mal and cfg.enable_mal:
-        settled = dict(floppy_scores)
-        settled.update({m: s for m, s in to_floppy})
-        settled.update({m: s for m, s in to_anilist})
-        for mal_id, score in sorted(settled.items()):
-            entry = anilist_by_mal.get(mal_id)
-            title = _al_title((entry or {}).get("media") or {}) if entry else f"mal:{mal_id}"
-            mal.update(mal_id, score_1dp=score)
-            log.info("%sRATE ->MAL     %s = %s", dry, title, round(score))
 
     for mal_id, f_score, a_score, _ in unresolved:
         title = _al_title((anilist_by_mal.get(mal_id) or {}).get("media") or {})
@@ -811,20 +818,13 @@ def main() -> int:
         len(snap),
         st.get("simkl_anime_cursor") or "-",
     )
-    # Drop anything a previous design left behind. Only MAL still needs a
-    # write-cache (it has no list-read API); an "already wrote this to AniList /
-    # Simkl" record is exactly the kind of remembered decision that drifted from
-    # reality, and reconcile no longer consults one.
-    stale = [k for k in ("anilist_updated_at",) if st.get(k) is not None]
-    written = st.get("written") or {}
-    dead = [t for t in ("anilist", "simkl", "simkl_status", "anilist_rating")
-            if t in written]
-    if dead:
-        st.set("written", {k: v for k, v in written.items() if k not in dead})
-        stale += [f"written.{t}" for t in dead]
-    for k in ("anilist_updated_at",):
-        if st.get(k) is not None:
-            st.set(k, None)
+    # Drop anything a previous design left behind. Every target is now read
+    # before it is written, so there is no "already wrote this" record anywhere -
+    # that remembered decision is what drifted from reality every time.
+    stale = [k for k in ("anilist_updated_at", "written", "simkl_catalogue")
+             if st.get(k) is not None]
+    for k in stale:
+        st.set(k, None)
     if stale:
         st.save()
         log.info("state: dropped keys from a previous design: %s", ", ".join(stale))

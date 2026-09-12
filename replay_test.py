@@ -77,8 +77,12 @@ class FakeAniList:
 
 
 class FakeMal:
-    def __init__(self):
+    def __init__(self, have=None):
         self.writes = []
+        self._have = dict(have or {})
+
+    def list_entries(self):
+        return dict(self._have)
 
     def update(self, mal_id, status=None, progress=None, score_1dp=None):
         self.writes.append((mal_id, status, progress, score_1dp))

@@ -334,6 +334,43 @@ def test_alias_onto_an_existing_entry_is_refused():
           (simkl.history, simkl.lists, simkl.ratings), ([], [], []))
 
 
+
+def test_mal_is_compared_not_blindly_written():
+    """MAL used to be write-only: every tick either blind-wrote every rating or
+    leaned on a remembered-writes cache. It is read now, so only real
+    differences are sent."""
+    print(chr(10) + "=" * 70)
+    print("RECONCILE - MAL is read first, so only differences are written")
+    print("=" * 70)
+    from aniprogress.mal import Mal
+
+    class FakeMal:
+        def __init__(self, have): self._have = have; self.writes = []
+        def list_entries(self): return dict(self._have)
+        def update(self, mal_id, **kw): self.writes.append((mal_id, kw)); return {}
+
+    rows = [sk_row(70, "completed", watched=12, total=12)]
+    st = _state_with_snapshot(rows)
+    al = StubAniList([al_entry(700, 70, "COMPLETED", progress=12, score_1dp=8.0)])
+    cfg = _cfg(); cfg.enable_mal = True
+
+    # MAL already agrees on everything -> not written at all
+    m = FakeMal({70: {"status": "completed", "progress": 12, "score": 8, "total": 12}})
+    reconcile_tick(cfg, _state_with_snapshot(rows), StubSimkl(rows, moved_since=[]), al, m)
+    check("an agreeing MAL entry is left alone", m.writes, [])
+
+    # MAL missing the score only -> just the score is sent
+    m = FakeMal({70: {"status": "completed", "progress": 12, "score": 0, "total": 12}})
+    reconcile_tick(cfg, _state_with_snapshot(rows), StubSimkl(rows, moved_since=[]), al, m)
+    check("only the differing field is sent", m.writes, [(70, {"score_1dp": 8.0})])
+
+    # MAL has never seen it -> status, progress and score together, one call
+    m = FakeMal({})
+    reconcile_tick(cfg, _state_with_snapshot(rows), StubSimkl(rows, moved_since=[]), al, m)
+    check("a new MAL entry is one call with every field",
+          m.writes, [(70, {"status": "COMPLETED", "progress": 12, "score_1dp": 8.0})])
+
+
 def main():
     for fn in (test_unit_reconcile_one, test_episode_count_mismatch_is_not_a_push,
                test_rewatch_moves_anilist_to_repeating, test_tick_simkl_moved_wins,
@@ -341,7 +378,8 @@ def main():
                test_removal_prunes_the_snapshot,
                test_absent_from_simkl_catalogue_is_reported_once,
                test_full_read_is_rate_limited,
-               test_alias_onto_an_existing_entry_is_refused):
+               test_alias_onto_an_existing_entry_is_refused,
+               test_mal_is_compared_not_blindly_written):
         fn()
     print("\n" + "=" * 70)
     if FAILURES:

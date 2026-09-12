@@ -1,8 +1,13 @@
-"""MyAnimeList API v2 client (mirror target only).
+"""MyAnimeList API v2 client.
 
-MAL scores are integers 1-10, so a 1dp score is rounded on the way out. That is
-acceptable precisely because nothing ever reads ratings back from MAL - it is a
-write-only mirror.
+MAL mirrors AniList. It is READ as well as written: without a list read there is
+nothing to compare against, and the only alternatives are blind writes on every
+tick or a remembered-writes cache - the drifting state that caused every earlier
+incident here. `list_entries()` is that read.
+
+MAL scores are integers 1-10, so a 1dp score is rounded on the way out. Nothing
+reads a rating back from MAL to overwrite AniList's decimal; the read is only
+ever used to decide whether a write is needed.
 
 Auth: MAL uses OAuth2 with PKCE. Get a Client ID at
 MyAnimeList -> Account Settings -> API -> Create ID, then run
@@ -23,11 +28,15 @@ TOKEN_URL = "https://myanimelist.net/v1/oauth2/token"
 
 STATUS_MAP = {
     "CURRENT": "watching",
+    "REPEATING": "watching",
     "COMPLETED": "completed",
     "PLANNING": "plan_to_watch",
     "PAUSED": "on_hold",
     "DROPPED": "dropped",
 }
+
+PAGE = 1000
+MAX_PAGES = 40
 
 
 class Mal:
@@ -63,6 +72,58 @@ class Mal:
         except (HTTPError, URLError, TimeoutError, ValueError) as e:
             log.error("mal token refresh failed: %s", e)
             return False
+
+    def list_entries(self) -> dict[int, dict]:
+        """The whole anime list: {mal_id: {status, progress, score, total}}.
+
+        `score` is 0 when unrated and `progress` can sit at 0 on a completed
+        entry, so both are reported as MAL states them - the caller decides what
+        a difference means.
+        """
+        out: dict[int, dict] = {}
+        offset = 0
+        for _ in range(MAX_PAGES):
+            url = f"{BASE}/users/@me/animelist?" + urllib.parse.urlencode({
+                "fields": "list_status,num_episodes", "limit": PAGE,
+                "offset": offset, "nsfw": "true"})
+            data = self._get(url)
+            rows = (data or {}).get("data") or []
+            for row in rows:
+                node, ls = row.get("node") or {}, row.get("list_status") or {}
+                try:
+                    mid = int(node.get("id"))
+                except (TypeError, ValueError):
+                    continue
+                out[mid] = {
+                    "status": str(ls.get("status") or ""),
+                    "progress": int(ls.get("num_episodes_watched") or 0),
+                    "score": int(ls.get("score") or 0),
+                    "total": int(node.get("num_episodes") or 0),
+                }
+            if not ((data or {}).get("paging") or {}).get("next"):
+                break
+            offset += PAGE
+        log.debug("mal: %d entries", len(out))
+        return out
+
+    def _get(self, url: str) -> dict:
+        for attempt in range(3):
+            try:
+                req = Request(url, headers=self._headers())
+                with urlopen(req, timeout=45) as r:
+                    return json.loads(r.read().decode())
+            except HTTPError as e:
+                if e.code == 401 and attempt == 0 and self._refresh():
+                    continue
+                if e.code == 429:
+                    time.sleep(5 * (attempt + 1))
+                    continue
+                log.error("mal GET -> HTTP %s %s", e.code, e.read()[:200])
+                raise
+            except (URLError, TimeoutError) as e:
+                log.warning("mal transport error (%s), retry %d", e, attempt + 1)
+                time.sleep(2 * (attempt + 1))
+        raise RuntimeError("mal list read failed after retries")
 
     def update(self, mal_id: int, status: str | None = None,
                progress: int | None = None, score_1dp: float | None = None) -> dict:

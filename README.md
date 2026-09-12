@@ -36,6 +36,10 @@ is the dedup: once a write lands the sides agree and the next pass is a no-op.
   library is re-read and the snapshot **replaced** so a deleted title is dropped rather
   than resurrected on the other side.
 
+**MyAnimeList** mirrors AniList when `ENABLE_MAL=true`. It is read before it is written, so
+a title MAL already has at the right status, episode and score is left alone; only the
+fields that differ are sent, one request per title.
+
 It does not write progress into Floppy. Floppy has its own scheduled Simkl import.
 
 **Ratings**
@@ -105,7 +109,7 @@ Read the log for a full cycle, then set `DRY_RUN` to `false` and restart.
 | Variable                | Default | What it does                                                                                                                             |
 | ----------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | `ENABLE_ANILIST`        | `true`  | Write progress, status and ratings to AniList.                                                                                           |
-| `ENABLE_MAL`            | `false` | Also mirror to MyAnimeList. Ratings are rounded.                                                                                         |
+| `ENABLE_MAL`            | `false` | Also mirror AniList to MyAnimeList — status, progress and rating (rounded). MAL is read first, so only real differences are written. Filling an empty MAL list is a large one-time write. |
 | `ENABLE_SIMKL_PUSH`     | `true`  | Allow writes back to Simkl. Turn off to make Simkl read-only.                                                                            |
 | `ENABLE_FLOPPY_RATINGS` | `false` | Sync ratings both ways with AniList, decimals intact. Needs `ENABLE_ANILIST`.                                                            |
 | `RATINGS_WINNER`        | `skip`  | What to do when Floppy and AniList hold *different* ratings. `skip` reports it and writes neither. `floppy` or `anilist` picks a winner. |
