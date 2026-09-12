@@ -123,10 +123,10 @@ class Mal:
                 if e.code == 429:
                     time.sleep(5 * (attempt + 1))
                     continue
-                log.error("mal GET -> HTTP %s %s", e.code, e.read()[:200])
+                log.debug("mal GET -> HTTP %s", e.code)
                 raise
             except (URLError, TimeoutError) as e:
-                log.warning("mal transport error (%s), retry %d", e, attempt + 1)
+                log.debug("mal transport error (%s), retry %d", e, attempt + 1)
                 time.sleep(2 * (attempt + 1))
         raise RuntimeError("mal list read failed after retries")
 
@@ -171,9 +171,11 @@ class Mal:
                         log.debug("mal PATCH %s redirected -> %s", mal_id, target)
                         url = urllib.parse.urljoin(url, target)
                         continue
-                log.error("mal PATCH %s -> HTTP %s %s", mal_id, e.code, e.read()[:200])
+                # The caller counts this and reports it in the tick summary, so
+                # one short line here - not an HTML error page in the log.
+                log.debug("mal PATCH %s -> HTTP %s", mal_id, e.code)
                 raise MalWriteFailed(f"HTTP {e.code}") from e
             except (URLError, TimeoutError) as e:
-                log.warning("mal transport error (%s), retry %d", e, attempt + 1)
+                log.debug("mal transport error (%s), retry %d", e, attempt + 1)
                 time.sleep(2 * (attempt + 1))
         raise MalWriteFailed("no response after retries")

@@ -30,8 +30,18 @@ def score_1dp(raw: Any) -> float | None:
     return round(v, 1) if v > 0 else None
 
 
+class FloppyWriteUncertain(RuntimeError):
+    """A write timed out or 5xx'd, so whether it landed is unknown.
+
+    Measured: a score PATCH read-timed-out twice and then 500'd, yet the value
+    HAD been applied. Reporting that as a plain failure is worse than useless -
+    the log then omits a write that really happened. The next tick re-reads both
+    libraries and compares, so an uncertain write self-heals either way.
+    """
+
+
 class Floppy:
-    def __init__(self, url: str, token: str, dry_run: bool = True, timeout: float = 30.0):
+    def __init__(self, url: str, token: str, dry_run: bool = True, timeout: float = 60.0):
         self.base = f"{url.rstrip('/')}/api/v1"
         self.token = token
         self.dry_run = dry_run
@@ -61,11 +71,14 @@ class Floppy:
                     log.error("floppy HTTP %s on %s %s: %s", e.code, method, path,
                               e.read()[:300])
                     raise
-                log.warning("floppy HTTP %s on %s, retry %d", e.code, path, attempt + 1)
+                log.debug("floppy HTTP %s on %s, retry %d", e.code, path, attempt + 1)
             except (URLError, TimeoutError) as e:
-                log.warning("floppy transport error (%s), retry %d", e, attempt + 1)
+                log.debug("floppy transport error (%s), retry %d", e, attempt + 1)
             time.sleep(2 * (attempt + 1))
-        raise RuntimeError(f"floppy request failed after retries: {method} {path}")
+        log.warning("floppy %s %s failed after every retry", method, path)
+        raise FloppyWriteUncertain(
+            f"{method} {path} timed out or errored on every attempt" +
+            (" - it may still have been applied" if method != "GET" else ""))
 
     # --- reads ---------------------------------------------------------------
     def _paged(self, path: str, params: dict | None = None) -> Iterator[dict]:

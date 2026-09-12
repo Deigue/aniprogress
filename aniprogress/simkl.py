@@ -18,6 +18,16 @@ log = logging.getLogger("aniprogress.simkl")
 BASE = "https://api.simkl.com"
 
 
+class SimklLookupFailed(RuntimeError):
+    """The catalogue could not be asked - NOT "Simkl has no such title".
+
+    The caller caches an absent title in state and never retries it, so folding
+    a transport failure into "absent" turns one flaky lookup into a permanent
+    hole in the sync. Raising keeps the two apart: the tick skips the title and
+    the next one asks again.
+    """
+
+
 class Simkl:
     def __init__(self, client_id: str, token: str, dry_run: bool = True):
         self.client_id = client_id
@@ -45,14 +55,15 @@ class Simkl:
             except HTTPError as e:
                 if e.code == 429:
                     wait = int(e.headers.get("Retry-After", 2 * (attempt + 1)))
-                    log.warning("simkl 429, sleeping %ss", wait)
+                    log.debug("simkl 429, sleeping %ss", wait)
                     time.sleep(wait)
                     continue
                 log.error("simkl %s %s -> HTTP %s", method, path, e.code)
                 raise
             except (URLError, TimeoutError) as e:
-                log.warning("simkl transport error (%s), retry %d", e, attempt + 1)
+                log.debug("simkl transport error (%s), retry %d", e, attempt + 1)
                 time.sleep(1.5 * (attempt + 1))
+        log.warning("simkl %s %s failed after every retry", method, path)
         raise RuntimeError(f"simkl {method} {path} failed after retries")
 
     # --- reads ---------------------------------------------------------------
@@ -83,15 +94,15 @@ class Simkl:
         episodes of "Sword Art OFFline" onto Sword Art Online. The caller needs
         the target id so it can tell a genuine new title from one of those.
 
-        A transport failure is not an answer, so it is reported as unresolvable
-        rather than as absent.
+        None means Simkl genuinely carries no such title - a permanent answer the
+        caller is free to cache. A transport failure is not an answer at all and
+        raises SimklLookupFailed instead, so it is never cached as absence.
         """
         try:
             res = self._req("GET", "/search/id",
                             params={"mal": str(int(mal_id))})
         except (HTTPError, URLError, TimeoutError, RuntimeError, ValueError) as e:
-            log.warning("simkl lookup for mal:%s failed (%s)", mal_id, e)
-            return None
+            raise SimklLookupFailed(f"mal:{mal_id} lookup failed ({e})") from e
         for hit in (res or []):
             if str(((hit.get("mal") or {}).get("id"))) != str(int(mal_id)):
                 continue          # a fuzzy match, not this title

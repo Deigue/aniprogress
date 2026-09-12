@@ -52,6 +52,14 @@ mutation ($mediaId: Int, $status: MediaListStatus, $progress: Int, $scoreRaw: In
 """
 
 
+class AniListLookupFailed(RuntimeError):
+    """AniList could not be asked - NOT "AniList has no such Media".
+
+    The caller records an absent title in state and stops naming it on later
+    ticks, so a transport failure reported as absence goes quiet permanently.
+    """
+
+
 class AniList:
     def __init__(self, token: str, dry_run: bool = True):
         self.token = token
@@ -62,6 +70,7 @@ class AniList:
         # lets us wait for the window instead of firing into a 429.
         self._remaining: int | None = None
         self._reset_at: float = 0.0
+        self._last_call: float = 0.0
 
     def _note_budget(self, headers) -> None:
         try:
@@ -73,6 +82,18 @@ class AniList:
         except (TypeError, ValueError):
             self._reset_at = 0.0
 
+    # AniList's edge (nginx/Cloudflare) rejects bursts with a header-less 429
+    # that has nothing to do with the GraphQL budget. Spacing requests out is
+    # what stops provoking it; MIN_GAP costs ~10s over a full tick.
+    MIN_GAP = 0.7
+    EDGE_RETRIES = 6
+
+    def _space(self) -> None:
+        gap = self.MIN_GAP - (time.time() - self._last_call)
+        if gap > 0:
+            time.sleep(gap)
+        self._last_call = time.time()
+
     def _pace(self) -> None:
         """Hold off while the budget is nearly spent, rather than firing into a
         429. AniList does not always send X-RateLimit-Reset, so without one fall
@@ -81,8 +102,8 @@ class AniList:
             return
         wait = (self._reset_at - time.time()) if self._reset_at else 10.0
         wait = min(max(wait, 1.0), 65.0)
-        log.info("anilist budget nearly spent (%s left), pausing %.0fs",
-                 self._remaining, wait)
+        log.debug("anilist budget nearly spent (%s left), pausing %.0fs",
+                  self._remaining, wait)
         time.sleep(wait)
         self._remaining = None
 
@@ -94,8 +115,10 @@ class AniList:
             "Accept": "application/json",
             "User-Agent": "anime-aniprogress/1.0",
         })
-        for attempt in range(4):
+        edge = 0
+        for attempt in range(8):
             self._pace()
+            self._space()
             try:
                 with urlopen(req, timeout=45) as r:
                     self._note_budget(r.headers)
@@ -115,14 +138,21 @@ class AniList:
                     if retry_after or remaining is not None:
                         self._note_budget(e.headers)
                         wait = min(int(retry_after or 60), 60)
-                        log.warning("anilist rate limited (%s of %s left), "
-                                    "sleeping %ss", remaining,
-                                    e.headers.get("X-RateLimit-Limit"), wait)
+                        log.debug("anilist rate limited (%s of %s left), "
+                                  "sleeping %ss", remaining,
+                                  e.headers.get("X-RateLimit-Limit"), wait)
                     else:
-                        wait = 2 * (2 ** attempt)
-                        log.warning("anilist edge 429 (no rate-limit headers, "
-                                    "transient), retry %d in %ss",
-                                    attempt + 1, wait)
+                        edge += 1
+                        if edge > self.EDGE_RETRIES:
+                            log.warning("anilist edge kept rejecting the request "
+                                        "after %d retries - giving up on it",
+                                        self.EDGE_RETRIES)
+                            raise
+                        wait = min(2 * (2 ** (edge - 1)), 60)
+                        # Routine and self-healing: AniList's edge rejects a
+                        # share of requests and the retry almost always works.
+                        # A retry that succeeds is not worth a warning.
+                        log.debug("anilist edge 429, retry %d in %ss", edge, wait)
                     time.sleep(wait)
                     continue
                 # AniList sits behind Cloudflare and returns transient 502/520/
@@ -130,8 +160,8 @@ class AniList:
                 # way a dropped connection is retried. A 4xx *is* an answer and
                 # must not be retried into a rate limit.
                 if e.code >= 500:
-                    log.warning("anilist HTTP %s (transient), retry %d",
-                                e.code, attempt + 1)
+                    log.debug("anilist HTTP %s (transient), retry %d",
+                              e.code, attempt + 1)
                     time.sleep(3 * (attempt + 1))
                     continue
                 # 404 is a valid "no such Media" answer (by_mal lookups); the
@@ -140,8 +170,9 @@ class AniList:
                 lvl("anilist HTTP %s: %s", e.code, e.read()[:300])
                 raise
             except (URLError, TimeoutError) as e:
-                log.warning("anilist transport error (%s), retry %d", e, attempt + 1)
+                log.debug("anilist transport error (%s), retry %d", e, attempt + 1)
                 time.sleep(2 * (attempt + 1))
+        log.warning("anilist request failed after every retry")
         raise RuntimeError("anilist request failed after retries")
 
     # --- reads ---------------------------------------------------------------
@@ -190,10 +221,10 @@ class AniList:
                 raise
             media = None          # a real "no such anime" - remember it
         except (URLError, TimeoutError, RuntimeError) as e:
-            # Could not ask. NOT cached: the answer is unknown, not absent, and
-            # one unreachable lookup must not abort the rest of the tick.
-            log.warning("anilist lookup for mal:%s unavailable (%s)", id_mal, e)
-            return None
+            # Could not ask. NOT cached and NOT returned as None: the answer is
+            # unknown, not absent. The caller isolates this to the one title and
+            # retries it next tick.
+            raise AniListLookupFailed(f"mal:{id_mal} lookup unavailable ({e})") from e
         self._mal_cache[id_mal] = media  # cache misses too, so we ask once
         return media
 

@@ -30,7 +30,7 @@ from .config import Config, load_dotenv
 from .floppy import Floppy
 from .mal import STATUS_MAP as MAL_STATUS
 from .mal import Mal
-from .simkl import Simkl
+from .simkl import Simkl, SimklLookupFailed
 from .state import State
 
 log = logging.getLogger("aniprogress")
@@ -435,6 +435,7 @@ def reconcile_tick(
     n_prog = n_stat = n_rate = 0
     unmatched: list[str] = []
     not_in_simkl: list[str] = []
+    sk_unresolved: list[str] = []
     aliased: list[str] = []
     failed: list[str] = []
     mal_writes: list[tuple[str, str, str]] = []
@@ -521,13 +522,24 @@ def reconcile_tick(
         if sk is None and any(i[0].startswith("sk_") for i in intents):
             target = cat.get(str(mal_id))
             if target is None:
-                target = simkl.resolve_mal(mal_id) or 0
-                cat[str(mal_id)] = target
-                cat_new = True
-                if not target:
-                    not_in_simkl.append(_named(title, mal_id))
-                elif int(target) in held:
-                    aliased.append(_named(title, mal_id))
+                try:
+                    target = simkl.resolve_mal(mal_id) or 0
+                except SimklLookupFailed as e:
+                    # Not an answer, so nothing is cached - caching a 0 here
+                    # would file the title under "not in Simkl, never retried"
+                    # permanently. Falling through with 0 drops this tick's
+                    # Simkl intents only; the next tick asks again.
+                    log.warning("%s?? %s - Simkl catalogue unreachable (%s)",
+                                dry, title, e)
+                    sk_unresolved.append(_named(title, mal_id))
+                    target = 0
+                else:
+                    cat[str(mal_id)] = target
+                    cat_new = True
+                    if not target:
+                        not_in_simkl.append(_named(title, mal_id))
+                    elif int(target) in held:
+                        aliased.append(_named(title, mal_id))
             if (not target) or int(target) in held:
                 # Either Simkl has no such title, or it resolves to an entry the
                 # library already holds under a different MAL id. Writing would
@@ -628,7 +640,8 @@ def reconcile_tick(
     st.set("reported", said)
 
     writes = len(al_new) + len(al_upd) + n_prog + n_stat + n_rate
-    noise = new_unmatched + new_no_mal + not_in_simkl + aliased + failed
+    noise = (new_unmatched + new_no_mal + not_in_simkl + sk_unresolved
+             + aliased + failed)
     if not (writes or mal_writes or noise):
         sizes = " / ".join(t for n, t in (
             (len(al_by_mal), f"AniList {len(al_by_mal)}"),
@@ -662,6 +675,8 @@ def reconcile_tick(
         log.info("%sMAL <- %-13s %s%s", dry, verb, t, f" ({detail})" if detail else "")
     _grouped(dry, "--  not in Simkl's catalogue, never retried:", not_in_simkl)
     _grouped(dry, "--  Simkl maps this onto a title it already holds, skipped:", aliased)
+    _grouped(dry, "??  Simkl catalogue unreachable, will retry next tick:",
+             sk_unresolved)
     _grouped(dry, "!!  write failed, will retry next tick:", failed)
     _grouped(dry, "--  no AniList entry exists:", new_unmatched)
     _grouped(dry, "--  no MAL id, cannot reach Simkl:", new_no_mal)
@@ -790,21 +805,39 @@ def ratings_tick(
         st.save()
         return
 
+    # Each write is isolated. One failure used to abort the tick: a Floppy PATCH
+    # that had ALREADY been applied raised after two timeouts and a 500, so the
+    # log never mentioned it and the two ratings behind it were never attempted.
     n_al = n_fl = 0
+    shaky: list[str] = []
     for mal_id, score in to_anilist:
         media = anilist_by_mal[mal_id].get("media") or {}
         if not media.get("id"):
             continue
-        anilist.save(int(media["id"]), score_1dp=score)
-        n_al += 1
         why = next((c[3] for c in conflicts if c[0] == mal_id), "gap")
+        try:
+            anilist.save(int(media["id"]), score_1dp=score)
+        except Exception as e:
+            log.warning("%sRATE ?? AniList %s = %s did not confirm (%s)",
+                        dry, _al_title(media), score, e)
+            shaky.append(_al_title(media))
+            continue
+        n_al += 1
         log.info("%sRATE ->AniList %s = %s (%s)", dry, _al_title(media), score, why)
 
     for mal_id, score in to_floppy:
-        floppy.set_score(mal_id, score)
-        n_fl += 1
         title = _al_title((anilist_by_mal.get(mal_id) or {}).get("media") or {})
         why = next((c[3] for c in conflicts if c[0] == mal_id), "gap")
+        try:
+            floppy.set_score(mal_id, score)
+        except Exception as e:
+            # A timeout is not proof it failed. Say so honestly; the next tick
+            # re-reads both sides and either finds agreement or retries.
+            log.warning("%sRATE ?? Floppy  %s = %s did not confirm (%s)",
+                        dry, title, score, e)
+            shaky.append(title)
+            continue
+        n_fl += 1
         log.info("%sRATE ->Floppy  %s = %s (%s)", dry, title, score, why)
 
     for mal_id, f_score, a_score, _ in unresolved:
@@ -817,6 +850,7 @@ def ratings_tick(
         _tally(
             ("AniList", [(n_al, f"~{n_al}")]),
             ("Floppy", [(n_fl, f"~{n_fl}")]),
+            ("UNCONFIRMED", [(len(shaky), str(len(shaky)))]),
             ("skip", [(len(unresolved), f"{len(unresolved)} need-decision"),
                       (len(unmatched), f"{len(unmatched)} no-AniList")]),
         ),
@@ -907,16 +941,23 @@ def main() -> int:
     )
 
     if anilist:
-        v = anilist.viewer()
-        fmt = (v.get("mediaListOptions") or {}).get("scoreFormat")
-        log.info("anilist user=%s scoreFormat=%s", v.get("name"), fmt)
-        if fmt != "POINT_10_DECIMAL":
-            log.warning(
-                "AniList scoreFormat is %s, not POINT_10_DECIMAL - "
-                "decimal ratings will not display correctly. "
-                "Change it in AniList settings.",
-                fmt,
-            )
+        # Informational only - the username and a scoreFormat warning. AniList's
+        # edge throws transient 429s, and letting one of those abort startup
+        # killed the container before a single tick had run.
+        try:
+            v = anilist.viewer()
+            fmt = (v.get("mediaListOptions") or {}).get("scoreFormat")
+            log.info("anilist user=%s scoreFormat=%s", v.get("name"), fmt)
+            if fmt != "POINT_10_DECIMAL":
+                log.warning(
+                    "AniList scoreFormat is %s, not POINT_10_DECIMAL - "
+                    "decimal ratings will not display correctly. "
+                    "Change it in AniList settings.",
+                    fmt,
+                )
+        except Exception as e:
+            log.warning("could not read the AniList profile (%s) - carrying on; "
+                        "check scoreFormat is POINT_10_DECIMAL yourself", e)
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: _stop.set())

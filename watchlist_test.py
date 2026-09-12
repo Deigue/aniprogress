@@ -24,7 +24,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from aniprogress.config import Config                    # noqa: E402
 from aniprogress.main import (_SNAPSHOT_SCHEMA, reconcile_one,  # noqa: E402
                               reconcile_tick)
-from aniprogress.simkl import Simkl                      # noqa: E402
+from aniprogress.anilist import AniListLookupFailed      # noqa: E402
+from aniprogress.simkl import Simkl, SimklLookupFailed   # noqa: E402
 from aniprogress.state import State                      # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)-7s %(message)s")
@@ -396,6 +397,66 @@ def test_one_bad_title_does_not_sink_the_tick():
     check("the failing one wrote nothing", [s for s in al.saves if s[0] == 11], [])
 
 
+def test_an_unreachable_simkl_catalogue_is_not_cached_as_absent():
+    """The catalogue cache is permanent and never retried, so a lookup that
+    could not be ASKED must not be filed alongside one that answered "no"."""
+    print(chr(10) + "=" * 70)
+    print("RECONCILE - an unreachable catalogue is retried, not cached")
+    print("=" * 70)
+    st = _state_with_snapshot([])
+
+    class Unreachable(StubSimkl):
+        fail = True
+
+        def resolve_mal(self, mal_id):
+            if self.fail:
+                self.lookups.append(int(mal_id))
+                raise SimklLookupFailed(f"mal:{mal_id} lookup failed (timeout)")
+            return super().resolve_mal(mal_id)   # records the lookup itself
+
+    simkl = Unreachable([], moved_since=[])
+    al = StubAniList([al_entry(99, 9, "COMPLETED", progress=12, score_1dp=8.0)])
+    reconcile_tick(_cfg(), st, simkl, al, None)
+    check("nothing was pushed while the catalogue was unreachable",
+          (simkl.history, simkl.lists, simkl.ratings), ([], [], []))
+    check("the failure was NOT cached as absent", st.get("simkl_ids") or {}, {})
+
+    simkl.fail = False
+    reconcile_tick(_cfg(), st, simkl, al, None)
+    check("the next tick asks again", simkl.lookups, [9, 9])
+    check("and the write lands once the catalogue answers",
+          bool(simkl.history or simkl.lists), True)
+
+
+def test_an_unreachable_anilist_lookup_is_not_reported_as_absent():
+    """`unmatched` is remembered in state and named only once, so a transport
+    failure recorded there goes permanently quiet. It must land in `failed`
+    (retried next tick) instead."""
+    print(chr(10) + "=" * 70)
+    print("RECONCILE - an unreachable AniList lookup is retried, not filed absent")
+    print("=" * 70)
+    rows = [sk_row(1, "completed", watched=12)]
+    st = _state_with_snapshot([])
+
+    class Unreachable(StubAniList):
+        fail = True
+
+        def by_mal(self, m):
+            if self.fail:
+                raise AniListLookupFailed(f"mal:{m} lookup unavailable (timeout)")
+            return super().by_mal(m)
+
+    al = Unreachable([], by_mal={1: {"id": 11, "title": {"romaji": "T"}}})
+    reconcile_tick(_cfg(), st, StubSimkl(rows, moved_since=rows), al, None)
+    check("nothing was created on AniList", al.saves, [])
+    check("it was NOT remembered as 'no AniList entry exists'",
+          (st.get("reported") or {}).get("no_anilist_media") or {}, {})
+
+    al.fail = False
+    reconcile_tick(_cfg(), st, StubSimkl(rows, moved_since=rows), al, None)
+    check("the next tick creates it", [s[0] for s in al.saves], [11])
+
+
 def main():
     for fn in (test_unit_reconcile_one, test_episode_count_mismatch_is_not_a_push,
                test_rewatch_moves_anilist_to_repeating, test_tick_simkl_moved_wins,
@@ -405,7 +466,9 @@ def main():
                test_full_read_is_rate_limited,
                test_alias_onto_an_existing_entry_is_refused,
                test_mal_is_compared_not_blindly_written,
-               test_one_bad_title_does_not_sink_the_tick):
+               test_one_bad_title_does_not_sink_the_tick,
+               test_an_unreachable_simkl_catalogue_is_not_cached_as_absent,
+               test_an_unreachable_anilist_lookup_is_not_reported_as_absent):
         fn()
     print("\n" + "=" * 70)
     if FAILURES:

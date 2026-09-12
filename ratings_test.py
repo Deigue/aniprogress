@@ -288,12 +288,43 @@ def test_reconcile_one_sided() -> None:
 
 
 
+
+def test_a_failing_rating_write_does_not_abort_the_tick() -> None:
+    """2026-09-12 live: a Floppy PATCH that HAD been applied raised after two
+    timeouts and a 500. The tick died, the write was never logged, and the two
+    ratings behind it were never attempted."""
+    print(chr(10) + "=" * 70)
+    print("RATINGS - one unconfirmed write is isolated, the rest still go")
+    print("=" * 70)
+    cfg = Config()
+    cfg.enable_anilist = cfg.enable_floppy_ratings = True
+    cfg.ratings_winner = "anilist"
+    cfg.dry_run = False
+
+    class FlakyFloppy(FakeFloppy):
+        def set_score(self, mal_id, score_1dp_value):
+            if int(mal_id) == 701:
+                raise RuntimeError("timed out or errored on every attempt")
+            return super().set_score(mal_id, score_1dp_value)
+
+    entries = [al_entry(7001, 701, 6.2, "Flaky"),
+               al_entry(7002, 702, 7.0, "Fine"),
+               al_entry(7003, 703, 8.0, "Also fine")]
+    fl = FlakyFloppy({701: 6.1, 702: 7.1, 703: 8.1})
+    al = FakeAniList(entries)
+    st = State(os.path.join(tempfile.mkdtemp(), "state.json"))
+    ratings_tick(cfg, st, fl, al)
+    check("the two healthy writes still landed",
+          sorted(m for m, _ in fl.writes), [702, 703])
+    check("the failing one wrote nothing", [w for w in fl.writes if w[0] == 701], [])
+
 def main() -> int:
     for fn in (test_plan_skip_is_default, test_plan_floppy_wins, test_plan_anilist_wins,
                test_tick_and_idempotence,
                test_decimals_survive, test_unrated_is_not_zero,
                test_reconcile_ratings_gapfill, test_reconcile_progress_and_status,
-               test_reconcile_completed_floor, test_reconcile_one_sided):
+               test_reconcile_completed_floor, test_reconcile_one_sided,
+               test_a_failing_rating_write_does_not_abort_the_tick):
         fn()
     print("\n" + "=" * 70)
     if FAILURES:
