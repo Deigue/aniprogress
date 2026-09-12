@@ -235,6 +235,20 @@ def _int_or_none(v):
         return None
 
 
+def _tally(*groups) -> str:
+    """Join "label a b c" segments with " | ", dropping every zero.
+
+    A summary line is a tally, not a form to fill in: "0 updated" is noise, and
+    with every provider active the long form no longer fits on one line.
+    """
+    out = []
+    for label, parts in groups:
+        kept = [text for count, text in parts if count]
+        if kept:
+            out.append(f"{label} {' '.join(kept)}" if label else " ".join(kept))
+    return "  |  ".join(out)
+
+
 def _named(title: str, mal_id: int) -> str:
     """Title plus its MAL id, without repeating the id when that IS the title."""
     return title if title == f"mal:{mal_id}" else f"{title} (mal:{mal_id})"
@@ -395,8 +409,15 @@ def reconcile_tick(
     if mal and cfg.enable_mal:
         try:
             mal_state = mal.list_entries()
-        except Exception:
-            log.exception("%scould not load MAL - skipping its mirror this tick", dry)
+        except Exception as e:
+            # One clear line, not a traceback every cycle. A rejected token is a
+            # standing condition, so say it loudly once and quietly after that -
+            # and carry on: MAL being unreachable must not stop the rest syncing.
+            first = not getattr(mal, "_read_failed", False)
+            mal._read_failed = True
+            (log.warning if first else log.debug)(
+                "%sMAL unreadable (%s) - mirror skipped. If the token was "
+                "rotated, re-run `python -m aniprogress.mal_auth`.", dry, e)
             mal = None
 
     def _al_state(e: dict) -> dict:
@@ -593,8 +614,11 @@ def reconcile_tick(
     writes = len(al_new) + len(al_upd) + n_prog + n_stat + n_rate
     noise = new_unmatched + new_no_mal + not_in_simkl + aliased
     if not (writes or mal_writes or noise):
-        log.info("%sRECONCILE ok - %d AniList / %d Simkl, in sync", dry,
-                 len(al_by_mal), len(snap))
+        sizes = " / ".join(t for n, t in (
+            (len(al_by_mal), f"AniList {len(al_by_mal)}"),
+            (len(snap), f"SIMKL {len(snap)}"),
+            (len(mal_state), f"MAL {len(mal_state)}")) if n)
+        log.info("%sRECONCILE ok - %s, in sync", dry, sizes)
         st.save()
         return
     by_status: dict[str, list[str]] = {}
@@ -625,10 +649,18 @@ def reconcile_tick(
     _grouped(dry, "--  no AniList entry exists:", new_unmatched)
     _grouped(dry, "--  no MAL id, cannot reach Simkl:", new_no_mal)
     log.info(
-        "%sRECONCILE: AniList %d new / %d updated, Simkl %d progress / %d status / "
-        "%d rating | skipped %d not-in-Simkl, %d aliased, %d no-AniList, %d no-MAL-id",
-        dry, len(al_new), len(al_upd), n_prog, n_stat, n_rate,
-        absent, alias_total, len(unmatched), len(al_no_mal),
+        "%sRECONCILE  %s", dry,
+        _tally(
+            ("AniList", [(len(al_new), f"+{len(al_new)}"),
+                         (len(al_upd), f"~{len(al_upd)}")]),
+            ("SIMKL", [(n_prog, f"prog{n_prog}"), (n_stat, f"stat{n_stat}"),
+                       (n_rate, f"rate{n_rate}")]),
+            ("MAL", [(len(mal_writes), str(len(mal_writes)))]),
+            ("skip", [(absent, f"{absent} not-in-SIMKL"),
+                      (alias_total, f"{alias_total} aliased"),
+                      (len(unmatched), f"{len(unmatched)} no-AniList"),
+                      (len(al_no_mal), f"{len(al_no_mal)} no-MAL-id")]),
+        ),
     )
     st.save()
 
@@ -740,19 +772,19 @@ def ratings_tick(
         st.save()
         return
 
-    wrote = 0
+    n_al = n_fl = 0
     for mal_id, score in to_anilist:
         media = anilist_by_mal[mal_id].get("media") or {}
         if not media.get("id"):
             continue
         anilist.save(int(media["id"]), score_1dp=score)
-        wrote += 1
+        n_al += 1
         why = next((c[3] for c in conflicts if c[0] == mal_id), "gap")
         log.info("%sRATE ->AniList %s = %s (%s)", dry, _al_title(media), score, why)
 
     for mal_id, score in to_floppy:
         floppy.set_score(mal_id, score)
-        wrote += 1
+        n_fl += 1
         title = _al_title((anilist_by_mal.get(mal_id) or {}).get("media") or {})
         why = next((c[3] for c in conflicts if c[0] == mal_id), "gap")
         log.info("%sRATE ->Floppy  %s = %s (%s)", dry, title, score, why)
@@ -762,8 +794,15 @@ def ratings_tick(
         log.warning("%sRATE DECIDE    %s floppy=%s anilist=%s (wrote neither)",
                     dry, title, f_score, a_score)
 
-    log.info("%sRATINGS: %d written, %d need-decision, %d Floppy-only",
-             dry, wrote, len(unresolved), len(unmatched))
+    log.info(
+        "%sRATINGS  %s", dry,
+        _tally(
+            ("AniList", [(n_al, f"~{n_al}")]),
+            ("Floppy", [(n_fl, f"~{n_fl}")]),
+            ("skip", [(len(unresolved), f"{len(unresolved)} need-decision"),
+                      (len(unmatched), f"{len(unmatched)} no-AniList")]),
+        ),
+    )
     st.save()
 
 
