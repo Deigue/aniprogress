@@ -493,6 +493,39 @@ def test_one_change_reaches_all_three_in_one_tick():
           m.writes, [(71, {"status": "COMPLETED", "progress": 12})])
 
 
+def test_a_late_simkl_row_is_re_pulled():
+    print("\n" + "=" * 70 + "\nRECONCILE - a rating Simkl served late is still picked up\n" + "=" * 70)
+    # The 2026-09-26 loop: a film was rated on Simkl, the pull right after came
+    # back without the rating, and the cursor moved past it. Every tick then
+    # re-sent the rating (a no-op on Simkl, so its activity never moved again).
+    from datetime import datetime, timedelta, timezone
+    iso = lambda d: d.strftime("%Y-%m-%dT%H:%M:%SZ")
+    now = datetime.now(timezone.utc)
+    rated_at, cursor = now - timedelta(minutes=5), now - timedelta(minutes=2)
+
+    class LaggedSimkl(StubSimkl):
+        def __init__(self):
+            super().__init__([sk_row(7, "completed", 1, rating=3, total=1)])
+            self.pulls = []
+        def activities(self):
+            return {"all": iso(cursor), "anime": {"removed_from_list": self._removed_at}}
+        def all_items(self, media_type="anime", status=None, date_from=None, extended="full"):
+            self.pulls.append(date_from)
+            # Simkl filters on added/rated time: a floor after the rating hides it.
+            return {"anime": list(self._rows) if date_from <= iso(rated_at) else []}
+
+    st = _state_with_snapshot([sk_row(7, "completed", 1, rating=None, total=1)])
+    for k in ("simkl_snapshot_at", "simkl_activity_all", "simkl_anime_cursor"):
+        st.set(k, iso(cursor))                   # activity has NOT moved since
+    simkl = LaggedSimkl()
+    al = StubAniList([al_entry(70, 7, "COMPLETED", progress=1, score_1dp=3.3)])
+    reconcile_tick(_cfg(), st, simkl, al, None)
+    check("quiet activity inside the lookback still pulls, from before the cursor",
+          [d <= iso(cursor - timedelta(minutes=59)) for d in simkl.pulls], [True])
+    check("the late rating reached the snapshot", st.get("simkl_anime")["7"]["rating"], 3.0)
+    check("so the rating is not re-sent to Simkl", simkl.ratings, [])
+
+
 def main():
     for fn in (test_unit_reconcile_one, test_episode_count_mismatch_is_not_a_push,
                test_rewatch_moves_anilist_to_repeating, test_tick_simkl_moved_wins,
@@ -505,7 +538,8 @@ def main():
                test_one_bad_title_does_not_sink_the_tick,
                test_an_unreachable_simkl_catalogue_is_not_cached_as_absent,
                test_an_unreachable_anilist_lookup_is_not_reported_as_absent,
-               test_one_change_reaches_all_three_in_one_tick):
+               test_one_change_reaches_all_three_in_one_tick,
+               test_a_late_simkl_row_is_re_pulled):
         fn()
     print("\n" + "=" * 70)
     if FAILURES:

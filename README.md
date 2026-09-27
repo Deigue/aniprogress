@@ -129,6 +129,7 @@ Read the log for a full cycle, then set `DRY_RUN` to `false` and restart.
 | `STATE_DIR`            | `/data`                | Where `state.json` lives — mount it, or every restart rebuilds the Simkl snapshot from scratch.                                                                      |
 | `SIMKL_EPOCH`          | `1970-01-01T00:00:00Z` | `date_from` for a full library read. Must be the real epoch — Simkl filters on *last modified*, and rows with an unset modified date are dropped by any later floor. |
 | `SIMKL_FULL_MIN_HOURS` | `6`                    | Minimum gap between full library reads (first run, after a title leaves a list, or when the snapshot's shape changes).                                               |
+| `SIMKL_LOOKBACK_MINUTES` | `60`                 | Overlap for each incremental pull, and how long after the last Simkl activity ticks keep re-pulling. Simkl's all-items data lags its activity stamps, so without it a late-landing change (e.g. a rating) is skipped forever. |
 | `LOG_LEVEL`            | `INFO`                 | `DEBUG` to see every decision.                                                                                                                                       |
 | `TZ`                   | container default      | Set it. Timestamps in logs are otherwise UTC.                                                                                                                        |
 

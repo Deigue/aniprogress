@@ -23,6 +23,7 @@ import signal
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 
 from .anilist import STATUS_MAP as AL_STATUS
 from .anilist import AniList
@@ -192,7 +193,9 @@ def simkl_snapshot(st: State) -> dict[str, dict]:
 # ever reshaped by a full read, so without this a new field stays absent - and a
 # rule that depends on it (the "finished" test needs `total`) silently never
 # fires against rows written by an older build.
-_SNAPSHOT_SCHEMA = 3
+# 4: forces one re-read to recover rows an un-overlapped cursor had skipped
+# past (Simkl ratings that landed after the pull meant to carry them).
+_SNAPSHOT_SCHEMA = 4
 
 
 def _rows_of(entries: list[dict]) -> dict[str, dict]:
@@ -226,6 +229,20 @@ def update_simkl_snapshot(st: State, entries: list[dict], *,
     """
     rows = _rows_of(entries)
     st.set("simkl_anime", rows if replace else {**simkl_snapshot(st), **rows})
+
+
+def _iso_ts(s: str) -> float:
+    """Simkl's `2026-09-27T03:45:28Z` -> epoch seconds (0 if unparseable)."""
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _iso_minus(s: str, seconds: float, *, floor: str) -> str:
+    """`s` moved back by `seconds`, never earlier than `floor`."""
+    t = max(_iso_ts(s) - seconds, _iso_ts(floor))
+    return datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _int_or_none(v):
@@ -359,10 +376,18 @@ def reconcile_tick(
                  (cfg.simkl_full_min_hours * 3600 - since_full) / 3600.0,
                  cfg.simkl_full_min_hours)
 
-    if full or (newest and newest != st.get("simkl_activity_all")):
+    # Simkl's all-items data trails its activity stamps, so a pull right after a
+    # change can come back without it - and a cursor that then moves past the
+    # change never sees it again. Every incremental pull reaches back
+    # SIMKL_LOOKBACK_MINUTES, and ticks keep pulling for that long after the
+    # last activity even when /sync/activities itself has gone quiet.
+    lookback = cfg.simkl_lookback_minutes * 60
+    recent = bool(newest) and time.time() - _iso_ts(newest) < lookback
+    if full or (newest and (newest != st.get("simkl_activity_all") or recent)):
         date_from = (
             cfg.simkl_epoch if full
-            else (st.get("simkl_anime_cursor") or cfg.simkl_epoch)
+            else _iso_minus(st.get("simkl_anime_cursor") or cfg.simkl_epoch,
+                            lookback, floor=cfg.simkl_epoch)
         )
         if full:
             log.info("%sfull Simkl re-read from %s (%s)", dry, date_from,
@@ -639,7 +664,8 @@ def reconcile_tick(
                     rate = f"rating {round(al_after['score'])}"
                 if fields:
                     mal.update(mal_id, **fields)
-                    verb = want_status or m_status or "?"
+                    verb = ("" if set(fields) == {"score_1dp"}
+                            else want_status or m_status or "?")
                     mal_writes.append((verb, title,
                                        _bits(new=fresh, prog=prog, was=was,
                                              rate=rate)))
@@ -696,7 +722,11 @@ def reconcile_tick(
         # The status is the verb, so progress, status and rating for one title
         # read as a single sentence instead of three lines to correlate by eye.
         fresh = w.get("was") == "new"
-        verb = w.get("status") or (w.get("was") or "watching")
+        # A rating-only write did not touch the status, so it names none. The
+        # old fallback printed "watching" for a completed film whose Simkl
+        # rating was being filled, which read as a status change.
+        rating_only = not (fresh or w.get("status") or "to" in w)
+        verb = "" if rating_only else (w.get("status") or w.get("was") or "")
         _wrote(dry, w["tag"], verb, w["title"], _bits(
             new=fresh,
             prog=((f"ep{w['to']}" if fresh else f"ep{w['from']}->ep{w['to']}")

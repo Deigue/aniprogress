@@ -92,6 +92,15 @@ class Config:
     simkl_full_min_hours: float = field(
         default_factory=lambda: _f("SIMKL_FULL_MIN_HOURS", 6.0))
 
+    # How far back each incremental pull reaches past the cursor, and how long
+    # after the last Simkl activity a tick keeps re-pulling. Simkl's all-items
+    # data lags its /sync/activities stamps: a rating made at 00:49:15 was
+    # missing from a 00:50:55 pull, the cursor moved past it, and nothing ever
+    # re-read that row - the rating was re-sent every tick forever. Rows merge
+    # idempotently, so the overlap costs nothing but a slightly larger read.
+    simkl_lookback_minutes: float = field(
+        default_factory=lambda: _f("SIMKL_LOOKBACK_MINUTES", 60.0))
+
     dry_run: bool = field(default_factory=lambda: _b("DRY_RUN", "true"))
     state_dir: str = field(default_factory=lambda: os.environ.get("STATE_DIR", "/data"))
     log_level: str = field(default_factory=lambda: os.environ.get("LOG_LEVEL", "INFO").upper())
