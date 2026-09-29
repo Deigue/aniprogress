@@ -8,7 +8,8 @@ through the real reconcile_tick with every client stubbed, and asserts:
   * a status change on Simkl (it appears in the incremental pull) flows to AniList
   * a status change on AniList (Simkl unchanged) flows to Simkl
   * COMPLETED on AniList is a floor - a Simkl rewatch marker never un-completes it
-  * a title on one side only is created on the other
+  * a title on one side only is created on the other, unless it was on both
+    last tick - then it was removed, and is removed everywhere
   * a second identical pass writes nothing
 
     python watchlist_test.py
@@ -83,6 +84,10 @@ class StubSimkl:
     def add_history(self, p): self.history.append(p); return {}
     def add_to_list(self, p): self.lists.append(p); return {}
     def add_rating(self, p): self.ratings.append(p); return {}
+
+    def remove_from_library(self, sid):
+        self.removed = getattr(self, "removed", []) + [int(sid)]
+        return True
     anime_entries = staticmethod(Simkl.anime_entries)
     ids_of = staticmethod(Simkl.ids_of)
 
@@ -99,6 +104,10 @@ class StubAniList:
     def save(self, media_id, status=None, progress=None, score_1dp=None):
         self.saves.append((media_id, status, progress, score_1dp))
         return {}
+
+    def delete(self, entry_id):
+        self.deleted = getattr(self, "deleted", []) + [int(entry_id)]
+        return True
 
 
 def _cfg():
@@ -526,6 +535,150 @@ def test_a_late_simkl_row_is_re_pulled():
     check("so the rating is not re-sent to Simkl", simkl.ratings, [])
 
 
+class DelMal:
+    def __init__(self, have): self._have, self.writes, self.deleted = dict(have), [], []
+    def list_entries(self): return dict(self._have)
+    def update(self, mal_id, **kw): self.writes.append((mal_id, kw)); return {}
+    def delete(self, mal_id): self.deleted.append(mal_id); return True
+
+
+def _paired_state(mals):
+    """Titles on both sides last tick, each snapshot row carrying its Simkl id."""
+    st = _state_with_snapshot([sk_row(m, "watching", 1) for m in mals])
+    snap = st.get("simkl_anime")
+    for m in mals:
+        snap[str(m)]["simkl"] = 900000 + m
+    st.set("simkl_anime", snap)
+    return st
+
+
+def _mal_cfg(dry=False):
+    cfg = _cfg()
+    cfg.enable_mal = True
+    cfg.dry_run = dry
+    return cfg
+
+
+def test_removed_on_anilist_is_removed_everywhere():
+    print("\n" + "=" * 70 + "\nREMOVALS - a title removed on AniList leaves Simkl and MAL\n" + "=" * 70)
+    st = _paired_state([5, 6])
+    rows = [sk_row(5, "watching", 1), sk_row(6, "watching", 1)]
+    both = [al_entry(50, 5, "CURRENT", 1), al_entry(60, 6, "CURRENT", 1)]
+    mal = DelMal({5: {"status": "watching", "progress": 1, "score": 0, "total": 24},
+                  6: {"status": "watching", "progress": 1, "score": 0, "total": 24}})
+    reconcile_tick(_mal_cfg(), st, StubSimkl(rows, moved_since=[]), StubAniList(both), mal)
+    check("first tick records the overlap", st.get("paired"), [5, 6])
+
+    simkl = StubSimkl(rows, moved_since=[])
+    al = StubAniList([both[1]], by_mal={5: {"id": 50, "idMal": 5, "title": {"english": "Five"}}})
+    reconcile_tick(_mal_cfg(), st, simkl, al, mal)
+    check("removed from Simkl by its SIMKL id", getattr(simkl, "removed", []), [900005])
+    check("removed from MAL", mal.deleted, [5])
+    check("NOT re-created on AniList", al.saves, [])
+    check("gone from the snapshot, so no ghost", sorted(st.get("simkl_anime")), ["6"])
+    check("no longer paired", st.get("paired"), [6])
+
+    al3 = StubAniList([both[1]])
+    reconcile_tick(_mal_cfg(), st, StubSimkl([rows[1]], moved_since=[]), al3, mal)
+    check("next tick writes nothing", (al3.saves, mal.deleted), ([], [5]))
+
+
+def test_removed_on_simkl_is_removed_everywhere():
+    print("\n" + "=" * 70 + "\nREMOVALS - a title removed on Simkl leaves AniList and MAL\n" + "=" * 70)
+    import time as _t
+    st = _paired_state([5, 6])
+    st.set("paired", [5, 6])
+    st.set("simkl_full_at", _t.time() - 7 * 3600)
+    rows = [sk_row(6, "watching", 1)]                    # 5 left Simkl
+    simkl = StubSimkl(rows, moved_since=[], removed_at="2026-06-06T00:00:00Z")
+    al = StubAniList([al_entry(50, 5, "CURRENT", 1), al_entry(60, 6, "CURRENT", 1)])
+    mal = DelMal({5: {"status": "watching", "progress": 1, "score": 0, "total": 24}})
+    reconcile_tick(_mal_cfg(), st, simkl, al, mal)
+    check("AniList entry deleted by its LIST ENTRY id", getattr(al, "deleted", []), [500])
+    check("removed from MAL", mal.deleted, [5])
+    check("NOT pushed back to Simkl", (simkl.history, simkl.lists), ([], []))
+
+
+def test_a_simkl_re_key_is_not_a_removal():
+    print("\n" + "=" * 70 + "\nREMOVALS - Simkl moving an entry to another MAL id deletes nothing\n" + "=" * 70)
+    import time as _t
+    st = _paired_state([5, 6])
+    st.set("paired", [5, 6])
+    st.set("simkl_full_at", _t.time() - 7 * 3600)
+    moved = sk_row(7, "watching", 1)
+    moved["show"]["ids"]["simkl"] = "900005"             # same Simkl entry, new MAL id
+    six = sk_row(6, "watching", 1)
+    six["show"]["ids"]["simkl"] = "900006"
+    simkl = StubSimkl([moved, six], moved_since=[], removed_at="2026-06-06T00:00:00Z")
+    al = StubAniList([al_entry(50, 5, "CURRENT", 1), al_entry(60, 6, "CURRENT", 1)])
+    reconcile_tick(_mal_cfg(), st, simkl, al, None)
+    check("AniList entry kept", getattr(al, "deleted", []), [])
+
+
+def test_mass_removal_is_treated_as_a_bad_read():
+    print("\n" + "=" * 70 + "\nREMOVALS - more than DELETE_MAX at once deletes nothing\n" + "=" * 70)
+    mals = [1, 2, 3, 4, 9]
+    st = _paired_state(mals)
+    st.set("paired", mals)
+    rows = [sk_row(m, "watching", 1) for m in mals]
+    simkl = StubSimkl(rows, moved_since=[])
+    by = {m: {"id": m * 10, "idMal": m, "title": {"english": f"t{m}"}} for m in mals}
+    al = StubAniList([al_entry(90, 9, "CURRENT", 1)], by_mal=by)   # 4 vanished
+    reconcile_tick(_mal_cfg(), st, simkl, al, None)
+    check("nothing removed from Simkl", getattr(simkl, "removed", []), [])
+    check("the usual gap-fill puts them back on AniList",
+          sorted(s[0] for s in al.saves), [10, 20, 30, 40])
+
+
+def test_a_simkl_change_outranks_an_anilist_removal():
+    print("\n" + "=" * 70 + "\nREMOVALS - a same-tick Simkl change keeps the title\n" + "=" * 70)
+    st = _paired_state([5, 6])
+    st.set("paired", [5, 6])
+    rows = [sk_row(5, "completed", 24), sk_row(6, "watching", 1)]
+    simkl = StubSimkl(rows, moved_since=[rows[0]])
+    al = StubAniList([al_entry(60, 6, "CURRENT", 1)],
+                     by_mal={5: {"id": 50, "idMal": 5, "title": {"english": "Five"}}})
+    reconcile_tick(_cfg(), st, simkl, al, None)
+    check("not removed from Simkl", getattr(simkl, "removed", []), [])
+    check("re-created on AniList from the change", [s[:2] for s in al.saves], [(50, "COMPLETED")])
+
+
+def test_dry_run_removal_repeats_instead_of_re_creating():
+    print("\n" + "=" * 70 + "\nREMOVALS - dry run keeps saying 'would remove'\n" + "=" * 70)
+    st = _paired_state([5, 6])
+    st.set("paired", [5, 6])
+    rows = [sk_row(5, "watching", 1), sk_row(6, "watching", 1)]
+    for _ in range(2):
+        al = StubAniList([al_entry(60, 6, "CURRENT", 1)],
+                         by_mal={5: {"id": 50, "idMal": 5, "title": {"english": "Five"}}})
+        reconcile_tick(_mal_cfg(dry=True), st, StubSimkl(rows, moved_since=[]), al, None)
+        check("no AniList create", al.saves, [])
+    check("still paired, still a removal", st.get("paired"), [5, 6])
+
+
+def test_deferred_re_read_is_said_once():
+    print("\n" + "=" * 70 + "\nRECONCILE - a deferred re-read is logged once, not per tick\n" + "=" * 70)
+    import time as _t
+    seen = []
+
+    class Grab(logging.Handler):
+        def emit(self, r):
+            if r.levelno >= logging.INFO and "re-read deferred" in r.getMessage():
+                seen.append(r)
+    h = Grab()
+    logging.getLogger("aniprogress").addHandler(h)
+    try:
+        st = _state_with_snapshot([sk_row(1, "watching", 1)])
+        st.set("simkl_full_at", _t.time())
+        simkl = StubSimkl([sk_row(1, "watching", 1)], moved_since=[],
+                          removed_at="2026-06-06T00:00:00Z")
+        for _ in range(3):
+            reconcile_tick(_cfg(), st, simkl, StubAniList([al_entry(10, 1, "CURRENT", 1)]), None)
+        check("one INFO line across three ticks", len(seen), 1)
+    finally:
+        logging.getLogger("aniprogress").removeHandler(h)
+
+
 def main():
     for fn in (test_unit_reconcile_one, test_episode_count_mismatch_is_not_a_push,
                test_rewatch_moves_anilist_to_repeating, test_tick_simkl_moved_wins,
@@ -539,7 +692,14 @@ def main():
                test_an_unreachable_simkl_catalogue_is_not_cached_as_absent,
                test_an_unreachable_anilist_lookup_is_not_reported_as_absent,
                test_one_change_reaches_all_three_in_one_tick,
-               test_a_late_simkl_row_is_re_pulled):
+               test_a_late_simkl_row_is_re_pulled,
+               test_removed_on_anilist_is_removed_everywhere,
+               test_removed_on_simkl_is_removed_everywhere,
+               test_a_simkl_re_key_is_not_a_removal,
+               test_mass_removal_is_treated_as_a_bad_read,
+               test_a_simkl_change_outranks_an_anilist_removal,
+               test_dry_run_removal_repeats_instead_of_re_creating,
+               test_deferred_re_read_is_said_once):
         fn()
     print("\n" + "=" * 70)
     if FAILURES:

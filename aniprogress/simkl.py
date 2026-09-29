@@ -146,6 +146,22 @@ class Simkl:
             return {"dry_run": True}
         return self._req("POST", "/sync/history/remove", body=payload)
 
+    def remove_from_library(self, simkl_id: int) -> bool:
+        """Take one anime off every Simkl list, history included.
+
+        A bare id with no episodes is Simkl's "Remove from list". Always by the
+        SIMKL id: a MAL id can resolve to a special's PARENT series, and a
+        removal that lands on the parent deletes the wrong show.
+        """
+        payload = {"anime": [{"ids": {"simkl": int(simkl_id)}}]}
+        if self.dry_run:
+            log.debug("[dry-run] simkl remove %s", json.dumps(payload))
+            return True
+        out = self._req("POST", "/sync/history/remove", body=payload) or {}
+        deleted = sum(int(v or 0) for v in (out.get("deleted") or {}).values())
+        gone = any((out.get("not_found") or {}).values())   # already not there
+        return bool(deleted or gone)
+
     def add_rating(self, payload: dict) -> Any:
         if self.dry_run:
             log.debug("[dry-run] simkl add_rating %s", json.dumps(payload)[:400])

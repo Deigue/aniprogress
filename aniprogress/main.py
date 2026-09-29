@@ -323,6 +323,104 @@ def _al_title(media: dict) -> str:
     return str(t.get("english") or t.get("romaji") or f"anilist:{media.get('id')}")
 
 
+def _removals(cfg: Config, dry: str, st: State, anilist: AniList, simkl: Simkl,
+              mal: Mal | None, al_by_mal: dict[int, dict], snap: dict[str, dict],
+              mal_state: dict[int, dict], simkl_moved: set[int],
+              before: dict[str, dict],
+              failed: list[str]) -> tuple[int, set[int], set[int]]:
+    """Carry a deletion across instead of undoing it.
+
+    A title in last tick's `paired` set (on AniList AND in the Simkl snapshot)
+    that has since left one side was removed there on purpose, so it is removed
+    from the other side and from MAL. The snapshot only loses a row on a full
+    read, so a Simkl-side removal surfaces when that read runs; an AniList-side
+    one surfaces on the next tick - even while Simkl's own removal of the same
+    title is still waiting on its deferred re-read.
+
+    Returns (titles removed, ids still pending, ids the per-title loop must
+    leave alone this tick).
+    """
+    raw = st.get("paired")
+    if raw is None or not al_by_mal or not snap:
+        # First run has nothing to compare with, and an empty side is a failed
+        # read, never someone emptying a whole library.
+        return 0, set(), set()
+    paired = {int(m) for m in raw}
+    on_sk = {int(k) for k in snap if _int_or_none(k) is not None}
+    # A Simkl change in this same tick outranks an AniList removal: the title
+    # is evidently still being watched, so it goes back on AniList instead.
+    left_al = sorted(m for m in paired - set(al_by_mal)
+                     if m in on_sk and m not in simkl_moved)
+    # A row that vanished from under one MAL id while its Simkl id is still in
+    # the library was re-keyed by Simkl (a catalogue fix), not removed by you.
+    still = {int(r["simkl"]) for r in snap.values() if r.get("simkl")}
+    remapped = {m for m in paired - on_sk
+                if int((before.get(str(m)) or {}).get("simkl") or 0) in still}
+    left_sk = sorted(m for m in paired - on_sk - remapped if m in al_by_mal)
+    left_both = sorted(m for m in paired - on_sk - remapped if m not in al_by_mal)
+    gone = left_al + left_sk + left_both
+    if not gone:
+        return 0, set(), set()
+    if len(gone) > cfg.delete_max:
+        # Not trusted as a removal. Falling through to the normal gap-fill puts
+        # them back, which is recoverable; deleting them would not be.
+        log.warning("%s%d titles left AniList/SIMKL in one tick, over DELETE_MAX=%d "
+                    "- treated as a bad read, nothing removed: %s", dry, len(gone),
+                    cfg.delete_max, ", ".join(f"mal:{m}" for m in gone[:20]))
+        return 0, set(), set()
+
+    rows = dict(snap)
+    removed, pending = 0, set()
+    for m in gone:
+        e = al_by_mal.get(m)
+        row = rows.get(str(m))
+        title = _al_title((e or {}).get("media") or {}) if e else f"mal:{m}"
+        if e is None:
+            try:
+                media = anilist.by_mal(m)       # the entry is gone; the Media is not
+                if media:
+                    title = _al_title(media)
+            except Exception:
+                pass
+        where = ("AniList" if m in left_al else "SIMKL" if m in left_sk
+                 else "AniList and SIMKL")
+        done: list[str] = []
+        try:
+            if row is not None:
+                sid = int(row.get("simkl") or 0)
+                if not sid:
+                    raise RuntimeError("snapshot row has no SIMKL id")
+                if not simkl.remove_from_library(sid):
+                    raise RuntimeError("SIMKL did not confirm the removal")
+                done.append("SIMKL")
+                if not dry:
+                    # The one write folded into the snapshot. Left in, the row
+                    # is a ghost until the next full read - and a ghost with no
+                    # AniList entry is exactly what re-created the title.
+                    rows.pop(str(m), None)
+            if e is not None:
+                if not anilist.delete(int(e["id"])):
+                    raise RuntimeError("AniList did not confirm the removal")
+                done.append("AniList")
+            if mal is not None and m in mal_state:
+                mal.delete(m)
+                done.append("MAL")
+        except Exception as ex:
+            log.warning("%s!! %s not removed (%s)", dry, title, ex)
+            failed.append(_named(title, m))
+            pending.add(m)
+            continue
+        finally:
+            if len(rows) != len(snap):
+                st.set("simkl_anime", rows)
+        if dry:
+            pending.add(m)
+        removed += 1
+        log.info("%s%-4s -- %-11s %s (left %s%s)", dry, "DEL", "removed", title,
+                 where, f"; from {', '.join(done)}" if done else "")
+    return removed, pending, set(gone)
+
+
 # --------------------------------------------------------------------------- #
 # RECONCILE: Simkl <-> AniList, one pass, both directions
 # --------------------------------------------------------------------------- #
@@ -371,10 +469,16 @@ def reconcile_tick(
     full = want_full and (not have_snapshot or reshape
                           or since_full >= cfg.simkl_full_min_hours * 3600)
     if want_full and not full:
-        log.info("%sa title left a Simkl list; full re-read deferred %.1fh "
-                 "(SIMKL_FULL_MIN_HOURS=%s)", dry,
-                 (cfg.simkl_full_min_hours * 3600 - since_full) / 3600.0,
-                 cfg.simkl_full_min_hours)
+        # Said once per removal, not once per tick: the wait is up to
+        # SIMKL_FULL_MIN_HOURS, and at a 2-minute tick that was 180 identical
+        # lines burying everything else.
+        first = getattr(simkl, "_deferral_noted", None) != removed_at
+        simkl._deferral_noted = removed_at
+        (log.info if first else log.debug)(
+            "%sa title left a Simkl list; full re-read deferred %.1fh "
+            "(SIMKL_FULL_MIN_HOURS=%s)", dry,
+            (cfg.simkl_full_min_hours * 3600 - since_full) / 3600.0,
+            cfg.simkl_full_min_hours)
 
     # Simkl's all-items data trails its activity stamps, so a pull right after a
     # change can come back without it - and a cursor that then moves past the
@@ -493,6 +597,18 @@ def reconcile_tick(
     failed: list[str] = []
     mal_writes: list[tuple[str, str, str]] = []
 
+    # --- removals --------------------------------------------------------------
+    # "Missing on one side" means "never synced" for a title Simkl or AniList has
+    # only just gained, but "deleted" for one that was on BOTH last tick - and
+    # treating a deletion as a gap re-created it. A test title removed from
+    # AniList came straight back from Simkl's snapshot, twice. `paired` is the
+    # last tick's observed overlap of the two libraries; a paired title that has
+    # left one side is removed from the others instead of being put back.
+    removed, pending, skip = _removals(
+        cfg, dry, st, anilist, simkl, mal, al_by_mal, snap, mal_state,
+        simkl_moved, before, failed)
+    snap = simkl_snapshot(st)
+
     # Does Simkl's catalogue carry this MAL id? A write for one it does not is
     # accepted and silently does nothing, so such a title would be "pending" on
     # every tick forever. Both answers are cached: a miss so it is never retried
@@ -513,7 +629,7 @@ def reconcile_tick(
 
     for m in sorted(set(snap) | {str(x) for x in al_by_mal}):
         mal_id = _int_or_none(m)
-        if mal_id is None:
+        if mal_id is None or mal_id in skip:
             continue
         srow = snap.get(str(mal_id))
         al_entry = al_by_mal.get(mal_id)
@@ -676,6 +792,9 @@ def reconcile_tick(
             # Simkl untouched, MAL half filled, and the tick dead mid-loop.
             log.warning("%s!! %s not synced (%s)", dry, title, e)
             failed.append(_named(title, mal_id))
+    # A removal that did not land (dry run, or a failed write) stays paired, so
+    # next tick sees it as a removal again rather than as a gap to re-fill.
+    st.set("paired", sorted({m for m in al_by_mal if str(m) in snap} | pending))
     if cat_new:
         st.set("simkl_ids", cat)
     absent = sum(1 for v in cat.values() if not v)
@@ -710,7 +829,7 @@ def reconcile_tick(
     writes = len(al_writes) + len(sk_writes)
     noise = (new_unmatched + new_no_mal + not_in_simkl + sk_unresolved
              + aliased + failed)
-    if not (writes or mal_writes or noise):
+    if not (writes or mal_writes or removed or noise):
         sizes = " / ".join(t for n, t in (
             (len(al_by_mal), f"AniList {len(al_by_mal)}"),
             (len(snap), f"SIMKL {len(snap)}"),
@@ -750,6 +869,7 @@ def reconcile_tick(
             ("AniList", [(al_new, f"+{al_new}"), (al_upd, f"~{al_upd}")]),
             ("SIMKL", [(sk_new, f"+{sk_new}"), (sk_upd, f"~{sk_upd}")]),
             ("MAL", [(mal_new, f"+{mal_new}"), (mal_upd, f"~{mal_upd}")]),
+            ("REMOVED", [(removed, str(removed))]),
             ("FAIL", [(len(failed), str(len(failed)))]),
             ("skip", [(absent, f"{absent} not-in-SIMKL"),
                       (alias_total, f"{alias_total} aliased"),

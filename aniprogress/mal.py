@@ -179,3 +179,29 @@ class Mal:
                 log.debug("mal transport error (%s), retry %d", e, attempt + 1)
                 time.sleep(2 * (attempt + 1))
         raise MalWriteFailed("no response after retries")
+
+    def delete(self, mal_id: int) -> bool:
+        """DELETE /anime/{id}/my_list_status. 404 = not on the list = done."""
+        if self.dry_run:
+            log.debug("[dry-run] mal delete %s", mal_id)
+            return True
+        url = f"{BASE}/anime/{int(mal_id)}/my_list_status"
+        for attempt in range(3):
+            try:
+                req = Request(url, method="DELETE", headers=self._headers())
+                with urlopen(req, timeout=30):
+                    return True
+            except HTTPError as e:
+                if e.code == 404:
+                    return True
+                if e.code == 401 and attempt == 0 and self._refresh():
+                    continue
+                if e.code == 429:
+                    time.sleep(5 * (attempt + 1))
+                    continue
+                log.debug("mal DELETE %s -> HTTP %s", mal_id, e.code)
+                raise MalWriteFailed(f"HTTP {e.code}") from e
+            except (URLError, TimeoutError) as e:
+                log.debug("mal transport error (%s), retry %d", e, attempt + 1)
+                time.sleep(2 * (attempt + 1))
+        raise MalWriteFailed("no response after retries")

@@ -52,6 +52,11 @@ mutation ($mediaId: Int, $status: MediaListStatus, $progress: Int, $scoreRaw: In
 """
 
 
+DELETE_MUTATION = """
+mutation ($id: Int) { DeleteMediaListEntry(id: $id) { deleted } }
+"""
+
+
 class AniListLookupFailed(RuntimeError):
     """AniList could not be asked - NOT "AniList has no such Media".
 
@@ -244,6 +249,14 @@ class AniList:
             log.debug("[dry-run] anilist save %s", variables)
             return {"dry_run": True}
         return (self._gql(SAVE_MUTATION, variables) or {}).get("SaveMediaListEntry") or {}
+
+    def delete(self, entry_id: int) -> bool:
+        """Remove one list entry by its LIST ENTRY id (not the media id)."""
+        if self.dry_run:
+            log.debug("[dry-run] anilist delete entry %s", entry_id)
+            return True
+        out = (self._gql(DELETE_MUTATION, {"id": int(entry_id)}) or {})
+        return bool((out.get("DeleteMediaListEntry") or {}).get("deleted"))
 
 
 # Simkl watchlist vocabulary -> AniList MediaListStatus

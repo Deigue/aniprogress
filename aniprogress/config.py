@@ -101,6 +101,13 @@ class Config:
     simkl_lookback_minutes: float = field(
         default_factory=lambda: _f("SIMKL_LOOKBACK_MINUTES", 60.0))
 
+    # Most titles a single tick may delete. A title that was on both AniList and
+    # Simkl and has left one of them is removed from the others - but a read
+    # that silently comes back short looks exactly like a mass removal (a bad
+    # date floor once hid 41 titles). Over this many at once, nothing is deleted
+    # and the usual re-create applies instead.
+    delete_max: int = field(default_factory=lambda: int(_f("DELETE_MAX", 3)))
+
     dry_run: bool = field(default_factory=lambda: _b("DRY_RUN", "true"))
     state_dir: str = field(default_factory=lambda: os.environ.get("STATE_DIR", "/data"))
     log_level: str = field(default_factory=lambda: os.environ.get("LOG_LEVEL", "INFO").upper())
