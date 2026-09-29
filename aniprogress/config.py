@@ -104,9 +104,12 @@ class Config:
     # Most titles a single tick may delete. A title that was on both AniList and
     # Simkl and has left one of them is removed from the others - but a read
     # that silently comes back short looks exactly like a mass removal (a bad
-    # date floor once hid 41 titles). Over this many at once, nothing is deleted
-    # and the usual re-create applies instead.
-    delete_max: int = field(default_factory=lambda: int(_f("DELETE_MAX", 3)))
+    # date floor once hid 41 titles). Over this many at once, the removals are
+    # HELD: nothing deleted, nothing re-created, a warning names them. Raise it
+    # to apply them; a later good read restores them if they were never gone.
+    # Simkl removals surface together at the next full read, so this counts
+    # everything removed there since the last one, not one sitting.
+    delete_max: int = field(default_factory=lambda: int(_f("DELETE_MAX", 10)))
 
     dry_run: bool = field(default_factory=lambda: _b("DRY_RUN", "true"))
     state_dir: str = field(default_factory=lambda: os.environ.get("STATE_DIR", "/data"))

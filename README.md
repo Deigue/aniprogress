@@ -36,8 +36,14 @@ is the dedup: once a write lands the sides agree and the next pass is a no-op.
   missing: it is removed from the other side and from MAL instead of being put back. The
   service remembers last tick's overlap (`paired` in state.json) to tell the two apart.
   A Simkl removal is seen when the next full read runs; an AniList one on the next tick.
-  More than `DELETE_MAX` titles vanishing in one tick is treated as a bad read — nothing is
-  removed and they are re-created as before.
+  More than `DELETE_MAX` titles vanishing in one tick could be a bad read, so they are
+  **held**: nothing deleted, nothing re-created, one warning naming them, and `HELD n` on
+  each summary line. If you really removed them, raise `DELETE_MAX` to at least that number
+  and redeploy — they are removed on the next tick; set it back afterwards. There is no time
+  limit: a held title stays held until you act. If it was a bad read, the next good read shows
+  the titles present again and the hold clears on its own. Simkl removals
+  surface together at the next full read, so the count is everything removed there since
+  the last one.
 - **Removing a title works.** Simkl publishes when something leaves a list; the whole
   library is re-read and the snapshot **replaced** so a deleted title is dropped rather
   than resurrected on the other side.
@@ -136,7 +142,7 @@ Read the log for a full cycle, then set `DRY_RUN` to `false` and restart.
 | `SIMKL_EPOCH`          | `1970-01-01T00:00:00Z` | `date_from` for a full library read. Must be the real epoch — Simkl filters on *last modified*, and rows with an unset modified date are dropped by any later floor. |
 | `SIMKL_FULL_MIN_HOURS` | `6`                    | Minimum gap between full library reads (first run, after a title leaves a list, or when the snapshot's shape changes).                                               |
 | `SIMKL_LOOKBACK_MINUTES` | `60`                 | Overlap for each incremental pull, and how long after the last Simkl activity ticks keep re-pulling. Simkl's all-items data lags its activity stamps, so without it a late-landing change (e.g. a rating) is skipped forever. |
-| `DELETE_MAX` | `3` | Most titles one tick may remove across trackers. More than this at once is taken as a short read, not a removal, and nothing is deleted. |
+| `DELETE_MAX` | `10` | Most titles one tick may remove across trackers. More than this at once is held (not deleted, not re-created) until you raise it or a later read restores them. |
 | `LOG_LEVEL`            | `INFO`                 | `DEBUG` to see every decision.                                                                                                                                       |
 | `TZ`                   | container default      | Set it. Timestamps in logs are otherwise UTC.                                                                                                                        |
 

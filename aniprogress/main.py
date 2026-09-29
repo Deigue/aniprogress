@@ -343,8 +343,9 @@ def _removals(cfg: Config, dry: str, st: State, anilist: AniList, simkl: Simkl,
     raw = st.get("paired")
     if raw is None or not al_by_mal or not snap:
         # First run has nothing to compare with, and an empty side is a failed
-        # read, never someone emptying a whole library.
-        return 0, set(), set()
+        # read, never someone emptying a whole library - so nothing is removed,
+        # and anything paired stays paired rather than being quietly forgotten.
+        return 0, {int(m) for m in raw or []}, set()
     paired = {int(m) for m in raw}
     on_sk = {int(k) for k in snap if _int_or_none(k) is not None}
     # A Simkl change in this same tick outranks an AniList removal: the title
@@ -359,15 +360,37 @@ def _removals(cfg: Config, dry: str, st: State, anilist: AniList, simkl: Simkl,
     left_sk = sorted(m for m in paired - on_sk - remapped if m in al_by_mal)
     left_both = sorted(m for m in paired - on_sk - remapped if m not in al_by_mal)
     gone = left_al + left_sk + left_both
+    if len(gone) <= cfg.delete_max:
+        st.set("removals_held", [])      # applied, or a good read restored them
     if not gone:
         return 0, set(), set()
     if len(gone) > cfg.delete_max:
-        # Not trusted as a removal. Falling through to the normal gap-fill puts
-        # them back, which is recoverable; deleting them would not be.
-        log.warning("%s%d titles left AniList/SIMKL in one tick, over DELETE_MAX=%d "
-                    "- treated as a bad read, nothing removed: %s", dry, len(gone),
-                    cfg.delete_max, ", ".join(f"mal:{m}" for m in gone[:20]))
-        return 0, set(), set()
+        # Too many at once to trust: a short read looks exactly like this. HELD,
+        # not re-created - putting them back used to undo a real clean-out for
+        # good (they were paired again by the next tick, so raising the cap
+        # afterwards found nothing to remove). Held titles stay paired and are
+        # left alone: a good read restores them, a raised cap removes them.
+        held = sorted(gone)
+        if held != sorted(st.get("removals_held") or []):
+            names = []
+            for m in held[:20]:
+                e = al_by_mal.get(m)
+                name = _al_title((e or {}).get("media") or {}) if e else f"mal:{m}"
+                if e is None:
+                    try:
+                        media = anilist.by_mal(m)
+                        if media:
+                            name = _al_title(media)
+                    except Exception:
+                        pass
+                names.append(name)
+            more = f" / +{len(held) - 20} more" if len(held) > 20 else ""
+            log.warning("%s%d removals held (over DELETE_MAX=%d): %s%s. Nothing is "
+                        "deleted or re-created while held, with no time limit. If you "
+                        "removed these, set DELETE_MAX=%d to apply them.", dry,
+                        len(held), cfg.delete_max, " / ".join(names), more, len(held))
+        st.set("removals_held", held)
+        return 0, set(held), set(held)
 
     rows = dict(snap)
     removed, pending = 0, set()
@@ -827,9 +850,10 @@ def reconcile_tick(
     al_new = sum(1 for w in al_writes.values() if w["was"] == "new")
     al_upd = len(al_writes) - al_new
     writes = len(al_writes) + len(sk_writes)
+    held = len(st.get("removals_held") or [])
     noise = (new_unmatched + new_no_mal + not_in_simkl + sk_unresolved
              + aliased + failed)
-    if not (writes or mal_writes or removed or noise):
+    if not (writes or mal_writes or removed or held or noise):
         sizes = " / ".join(t for n, t in (
             (len(al_by_mal), f"AniList {len(al_by_mal)}"),
             (len(snap), f"SIMKL {len(snap)}"),
@@ -870,6 +894,7 @@ def reconcile_tick(
             ("SIMKL", [(sk_new, f"+{sk_new}"), (sk_upd, f"~{sk_upd}")]),
             ("MAL", [(mal_new, f"+{mal_new}"), (mal_upd, f"~{mal_upd}")]),
             ("REMOVED", [(removed, str(removed))]),
+            ("HELD", [(held, f"{held} over DELETE_MAX")]),
             ("FAIL", [(len(failed), str(len(failed)))]),
             ("skip", [(absent, f"{absent} not-in-SIMKL"),
                       (alias_total, f"{alias_total} aliased"),

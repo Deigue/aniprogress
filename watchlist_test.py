@@ -615,19 +615,81 @@ def test_a_simkl_re_key_is_not_a_removal():
     check("AniList entry kept", getattr(al, "deleted", []), [])
 
 
-def test_mass_removal_is_treated_as_a_bad_read():
-    print("\n" + "=" * 70 + "\nREMOVALS - more than DELETE_MAX at once deletes nothing\n" + "=" * 70)
+def _over_cap():
+    """Five paired titles; four have just left AniList. DELETE_MAX is 3."""
     mals = [1, 2, 3, 4, 9]
     st = _paired_state(mals)
     st.set("paired", mals)
-    rows = [sk_row(m, "watching", 1) for m in mals]
-    simkl = StubSimkl(rows, moved_since=[])
+    rows = [sk_row(m, "watching", 1) for m in mals]   # as _paired_state holds them
     by = {m: {"id": m * 10, "idMal": m, "title": {"english": f"t{m}"}} for m in mals}
-    al = StubAniList([al_entry(90, 9, "CURRENT", 1)], by_mal=by)   # 4 vanished
-    reconcile_tick(_mal_cfg(), st, simkl, al, None)
+    cfg = _mal_cfg()
+    cfg.delete_max = 3
+    return st, rows, by, cfg
+
+
+def _warnings_during(fn):
+    seen = []
+
+    class Grab(logging.Handler):
+        def emit(self, r):
+            if r.levelno >= logging.WARNING and "removals held" in r.getMessage():
+                seen.append(r.getMessage())
+    h = Grab()
+    logging.getLogger("aniprogress").addHandler(h)
+    try:
+        fn()
+    finally:
+        logging.getLogger("aniprogress").removeHandler(h)
+    return seen
+
+
+def test_mass_removal_is_held_not_re_created():
+    print("\n" + "=" * 70 + "\nREMOVALS - more than DELETE_MAX at once is HELD\n" + "=" * 70)
+    st, rows, by, cfg = _over_cap()
+    simkl = StubSimkl(rows, moved_since=[])
+    als = []
+
+    def two_ticks():
+        for _ in range(2):
+            al = StubAniList([al_entry(90, 9, "CURRENT", 1)], by_mal=by)
+            als.append(al)
+            reconcile_tick(cfg, st, simkl, al, None)
+    warned = _warnings_during(two_ticks)
     check("nothing removed from Simkl", getattr(simkl, "removed", []), [])
-    check("the usual gap-fill puts them back on AniList",
-          sorted(s[0] for s in al.saves), [10, 20, 30, 40])
+    check("NOT re-created on AniList either", [a.saves for a in als], [[], []])
+    check("still paired, so the removal is not lost", st.get("paired"), [1, 2, 3, 4, 9])
+    check("warned once, not per tick", len(warned), 1)
+    check("the warning names them and the fix",
+          all(s in warned[0] for s in ("t1 / t2 / t3 / t4", "DELETE_MAX=4")), True)
+
+
+def test_raising_the_cap_applies_held_removals():
+    print("\n" + "=" * 70 + "\nREMOVALS - raising DELETE_MAX applies what was held\n" + "=" * 70)
+    st, rows, by, cfg = _over_cap()
+    reconcile_tick(cfg, st, StubSimkl(rows, moved_since=[]),
+                   StubAniList([al_entry(90, 9, "CURRENT", 1)], by_mal=by), None)
+    cfg.delete_max = 4                                   # user raises it, redeploys
+    simkl = StubSimkl(rows, moved_since=[])
+    al = StubAniList([al_entry(90, 9, "CURRENT", 1)], by_mal=by)
+    reconcile_tick(cfg, st, simkl, al, None)
+    check("all four removed from Simkl", sorted(getattr(simkl, "removed", [])),
+          [900001, 900002, 900003, 900004])
+    check("hold cleared", st.get("removals_held"), [])
+    check("only the survivor still paired", st.get("paired"), [9])
+
+
+def test_a_bad_read_restores_and_clears_the_hold():
+    print("\n" + "=" * 70 + "\nREMOVALS - a later good read ends the hold with nothing lost\n" + "=" * 70)
+    st, rows, by, cfg = _over_cap()
+    reconcile_tick(cfg, st, StubSimkl(rows, moved_since=[]),
+                   StubAniList([al_entry(90, 9, "CURRENT", 1)], by_mal=by), None)
+    full = [al_entry(m * 10, m, "CURRENT", 1) for m in (1, 2, 3, 4, 9)]
+    simkl = StubSimkl(rows, moved_since=[])
+    al = StubAniList(full, by_mal=by)                    # the read comes back whole
+    reconcile_tick(cfg, st, simkl, al, None)
+    check("nothing removed, nothing written", (getattr(simkl, "removed", []), al.saves),
+          ([], []))
+    check("hold cleared", st.get("removals_held"), [])
 
 
 def test_a_simkl_change_outranks_an_anilist_removal():
@@ -696,7 +758,9 @@ def main():
                test_removed_on_anilist_is_removed_everywhere,
                test_removed_on_simkl_is_removed_everywhere,
                test_a_simkl_re_key_is_not_a_removal,
-               test_mass_removal_is_treated_as_a_bad_read,
+               test_mass_removal_is_held_not_re_created,
+               test_raising_the_cap_applies_held_removals,
+               test_a_bad_read_restores_and_clears_the_hold,
                test_a_simkl_change_outranks_an_anilist_removal,
                test_dry_run_removal_repeats_instead_of_re_creating,
                test_deferred_re_read_is_said_once):
