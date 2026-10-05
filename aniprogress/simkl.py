@@ -85,6 +85,17 @@ class Simkl:
                         media_type)
         return self._req("GET", path, params)
 
+    def rated_items(self, media_type: str = "anime", date_from: str = "") -> Any:
+        """GET /sync/ratings/{type} - items whose rating changed since date_from.
+
+        all-items' date_from does NOT see a rating change: a title rated at
+        00:02:07Z is missing from a pull floored at 23:00Z the night before.
+        This feed filters on user_rated_at (strictly after date_from) and
+        returns the same row shape.
+        """
+        return self._req("GET", f"/sync/ratings/{media_type}",
+                         {"date_from": date_from})
+
     def resolve_mal(self, mal_id: int) -> int | None:
         """MAL id -> the Simkl id Simkl would actually write to, or None.
 

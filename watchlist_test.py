@@ -520,7 +520,7 @@ def test_a_late_simkl_row_is_re_pulled():
             return {"all": iso(cursor), "anime": {"removed_from_list": self._removed_at}}
         def all_items(self, media_type="anime", status=None, date_from=None, extended="full"):
             self.pulls.append(date_from)
-            # Simkl filters on added/rated time: a floor after the rating hides it.
+            # A floor after the change hides it.
             return {"anime": list(self._rows) if date_from <= iso(rated_at) else []}
 
     st = _state_with_snapshot([sk_row(7, "completed", 1, rating=None, total=1)])
@@ -533,6 +533,46 @@ def test_a_late_simkl_row_is_re_pulled():
           [d <= iso(cursor - timedelta(minutes=59)) for d in simkl.pulls], [True])
     check("the late rating reached the snapshot", st.get("simkl_anime")["7"]["rating"], 3.0)
     check("so the rating is not re-sent to Simkl", simkl.ratings, [])
+
+
+def test_a_rating_only_change_is_read_from_the_ratings_feed():
+    print("\n" + "=" * 70 + "\nRECONCILE - a rating-only change comes from Simkl's ratings feed\n" + "=" * 70)
+    # The 2026-10-03 loop: all-items' date_from never returns a row whose only
+    # change is its rating, however far back the lookback reaches. The snapshot
+    # kept rating None and the rating was re-sent every tick until a full read.
+    from datetime import datetime, timedelta, timezone
+    iso = lambda d: d.strftime("%Y-%m-%dT%H:%M:%SZ")
+    now = datetime.now(timezone.utc)
+    rated_at = now - timedelta(minutes=1)
+
+    class RatingBlindSimkl(StubSimkl):
+        def __init__(self):
+            # The ratings feed's copy is STALE on progress (1 vs the snapshot's 3).
+            super().__init__([sk_row(7, "watching", 1, rating=8)], moved_since=[])
+            self.rated_pulls = []
+        def activities(self):
+            return {"all": iso(rated_at), "anime": {
+                "removed_from_list": self._removed_at, "rated_at": iso(rated_at)}}
+        def rated_items(self, media_type="anime", date_from=""):
+            self.rated_pulls.append(date_from)
+            return {"anime": list(self._rows)}
+
+    st = _state_with_snapshot([sk_row(7, "watching", 3, rating=None)])
+    simkl = RatingBlindSimkl()
+    al = StubAniList([al_entry(70, 7, "CURRENT", progress=3, score_1dp=8.3)])
+    reconcile_tick(_cfg(), st, simkl, al, None)
+    row = st.get("simkl_anime")["7"]
+    check("the ratings feed was asked", len(simkl.rated_pulls), 1)
+    check("the rating reached the snapshot", row["rating"], 8.0)
+    check("progress was NOT taken from the ratings feed", row["progress"], 3)
+    check("so the rating is not re-sent to Simkl", simkl.ratings, [])
+    check("and nothing else was written", (simkl.history, simkl.lists, al.saves), ([], [], []))
+
+    # A tick with no rating activity in the window does not ask.
+    simkl2 = StubSimkl([])
+    reconcile_tick(_cfg(), st, simkl2, al, None)
+    check("no rated_at stamp -> ratings feed not called",
+          hasattr(simkl2, "rated_pulls"), False)
 
 
 class DelMal:
@@ -755,6 +795,7 @@ def main():
                test_an_unreachable_anilist_lookup_is_not_reported_as_absent,
                test_one_change_reaches_all_three_in_one_tick,
                test_a_late_simkl_row_is_re_pulled,
+               test_a_rating_only_change_is_read_from_the_ratings_feed,
                test_removed_on_anilist_is_removed_everywhere,
                test_removed_on_simkl_is_removed_everywhere,
                test_a_simkl_re_key_is_not_a_removal,

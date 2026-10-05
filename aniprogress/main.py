@@ -522,6 +522,20 @@ def reconcile_tick(
                      "snapshot shape changed" if reshape else "a title left a list")
         rows = Simkl.anime_entries(simkl.all_items("anime", date_from=date_from))
         update_simkl_snapshot(st, rows, replace=full)
+        # all-items' date_from never returns a row whose only change is its
+        # rating, so a rating we pushed stayed None in the snapshot and was
+        # re-sent every tick until the next full read (2026-10-03: two titles,
+        # ~1800 lines). Simkl's ratings feed does filter on rated time. Only
+        # the rating is taken from it - status and progress stay with
+        # all-items, so a lagging copy can never fake a rewatch.
+        rated_at = str((acts.get("anime") or {}).get("rated_at") or "")
+        if not full and rated_at and _iso_ts(rated_at) >= _iso_ts(date_from):
+            snap_now = simkl_snapshot(st)
+            for key, row in _rows_of(Simkl.anime_entries(
+                    simkl.rated_items("anime", date_from=date_from))).items():
+                if key in snap_now and row["rating"] is not None:
+                    snap_now[key] = {**snap_now[key], "rating": row["rating"]}
+            st.set("simkl_anime", snap_now)
         st.set("simkl_snapshot_at", newest or date_from)
         if full:
             # Only record the removal cursor once the prune actually happened,
